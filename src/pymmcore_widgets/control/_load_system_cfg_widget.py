@@ -1,15 +1,35 @@
 from __future__ import annotations
 
 from pymmcore_plus import CMMCorePlus
+from qtpy.QtCore import Qt, QThread, Signal
 from qtpy.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLineEdit,
+    QMessageBox,
+    QProgressDialog,
     QPushButton,
     QWidget,
 )
 
 from pymmcore_widgets._util import load_system_config
+
+
+class _CfgLoadThread(QThread):
+    """Worker: run load_system_config off the main thread."""
+
+    failed = Signal(str)
+
+    def __init__(self, path: str, mmc: CMMCorePlus, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._path = path
+        self._mmc = mmc
+
+    def run(self) -> None:
+        try:
+            load_system_config(self._path, self._mmc)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
 
 
 class ConfigurationWidget(QWidget):
@@ -60,8 +80,33 @@ class ConfigurationWidget(QWidget):
             self.cfg_LineEdit.setText(filename)
 
     def _load_cfg(self) -> None:
-        """Load the config path currently in the line_edit."""
-        load_system_config(self.cfg_LineEdit.text(), self._mmc)
+        """Load the config path currently in the line_edit, off the main thread.
+
+        A modal progress dialog is shown while loading to keep the GUI responsive.
+        """
+        path = self.cfg_LineEdit.text().strip()
+
+        dlg = QProgressDialog("Loading configuration…", None, 0, 0, self)
+        dlg.setWindowTitle("Loading")
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+        dlg.show()
+        self.load_cfg_Button.setEnabled(False)
+
+        def _on_done() -> None:
+            dlg.close()
+            self.load_cfg_Button.setEnabled(True)
+
+        def _on_failed(msg: str) -> None:
+            dlg.close()
+            self.load_cfg_Button.setEnabled(True)
+            QMessageBox.critical(self, "Configuration Load Error", msg)
+
+        self._load_thread = _CfgLoadThread(path, self._mmc, parent=self)
+        self._load_thread.finished.connect(_on_done)
+        self._load_thread.failed.connect(_on_failed)
+        self._load_thread.start()
 
     def setTitle(self, title: str) -> None:
         _show_deprecation("setTitle")
