@@ -933,12 +933,16 @@ class AffineState:
     def _compute_system_affine(self) -> np.ndarray:
         flip_x = flip_y = False
         if cam := self.mmc.getCameraDevice():
-            flip_x = self.mmc.getProperty(cam, Keyword.Transpose_MirrorX) == "1"
-            flip_y = self.mmc.getProperty(cam, Keyword.Transpose_MirrorY) == "1"
+            # not every camera defines the Transpose_* properties
+            # (e.g. python devices loaded into a UniMMCore)
+            if self.mmc.hasProperty(cam, Keyword.Transpose_MirrorX):
+                flip_x = self.mmc.getProperty(cam, Keyword.Transpose_MirrorX) == "1"
+            if self.mmc.hasProperty(cam, Keyword.Transpose_MirrorY):
+                flip_y = self.mmc.getProperty(cam, Keyword.Transpose_MirrorY) == "1"
 
-        if self._pixel_config_is_identity():
-            return self._linear_matrix(flip_x, flip_y)
-        return self._pixel_config_matrix(flip_x, flip_y)
+        if self._pixel_config_is_usable():
+            return self._pixel_config_matrix(flip_x, flip_y)
+        return self._linear_matrix(flip_x=flip_x, flip_y=flip_y)
 
     def _linear_matrix(
         self, rotation: float = 0, flip_x: bool = False, flip_y: bool = False
@@ -962,17 +966,25 @@ class AffineState:
             S[1, 1] *= -1
         return R @ S
 
-    def _pixel_config_is_identity(self) -> bool:
-        return np.allclose(self.pixel_size_affine, (1.0, 0.0, 0.0, 0.0, 1.0, 0.0))
+    def _pixel_config_is_usable(self) -> bool:
+        """Return True if the pixel size affine carries usable scale information.
+
+        The identity affine means "not configured", and a singular one (e.g. the
+        all-zeros affine reported when no pixel size config is defined) would
+        collapse everything onto a point, so both fall back to scaling by the
+        plain pixel size instead.
+        """
+        affine = np.asarray(self.pixel_size_affine, dtype=float)
+        if affine.shape != (6,):  # pragma: no cover
+            return False
+        if np.allclose(affine, (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)):
+            return False
+        return not np.isclose(np.linalg.det(affine.reshape(2, 3)[:, :2]), 0.0)
 
     def _pixel_config_matrix(
         self, flip_x: bool = False, flip_y: bool = False
     ) -> np.ndarray:
-        """Return the current pixel configuration affine, if set.
-
-        If the pixel configuration is not set (i.e. is the identity matrix),
-        it will return None.
-        """
+        """Return the current pixel configuration affine as a 4x4 matrix."""
         tform = np.eye(4)
         tform[:2, :3] = np.array(self.pixel_size_affine).reshape(2, 3)
         # flip the image if required
