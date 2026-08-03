@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import pytest
 import useq
 from pymmcore_plus import CMMCorePlus
 
@@ -207,3 +208,76 @@ def test_plate_calibration_test_positions(global_mmcore: CMMCorePlus, qtbot) -> 
         data.append((hover_item_data.x, hover_item_data.y, hover_item_data.name))
 
     assert data == expected_data
+
+
+def test_plate_calibration_two_point_mode(global_mmcore: CMMCorePlus, qtbot) -> None:
+    """Two wells are enough when the rotation is assumed to be zero."""
+    from unittest.mock import Mock
+
+    from tests._utils import wait_signal
+
+    from pymmcore_widgets.hcs._plate_calibration_widget import CalibrationMode
+
+    wdg = PlateCalibrationWidget(mmcore=global_mmcore)
+    wdg.show()
+    qtbot.addWidget(wdg)
+    wdg.setValue("96-well")
+    assert wdg.calibrationMode() is CalibrationMode.THREE_POINT
+
+    wdg.setCalibrationMode(CalibrationMode.TWO_POINT)
+    assert wdg.calibrationMode() is CalibrationMode.TWO_POINT
+
+    # calibrate A1 and H12, i.e. opposite corners of the plate
+    spacing = 9000.0
+    a1 = (1000.0, 2000.0)
+    for (row, col), center in {
+        (0, 0): a1,
+        (7, 11): (a1[0] + 11 * spacing, a1[1] - 7 * spacing),
+    }.items():
+        wdg._plate_view.setSelectedIndices({(row, col)})
+        with wait_signal(qtbot, wdg.calibrationChanged):
+            wdg._current_calibration_widget().setWellCenter(center)
+
+    value = wdg.value()
+    assert value is not None
+    assert value.a1_center_xy == pytest.approx(a1, abs=0.01)
+    assert value.rotation == pytest.approx(0.0)
+    assert wdg._well_spacing == pytest.approx((9.0, 9.0), abs=0.001)
+
+    # switching back to three points makes it incomplete again
+    mock = Mock()
+    wdg.calibrationChanged.connect(mock)
+    wdg.setCalibrationMode(CalibrationMode.THREE_POINT)
+    mock.assert_called_once_with(False)
+    assert "at least 3 wells" in wdg._info.text()
+
+
+def test_plate_calibration_two_point_same_row(
+    global_mmcore: CMMCorePlus, qtbot
+) -> None:
+    """Two wells in the same row fall back to the nominal row spacing."""
+    from tests._utils import wait_signal
+
+    from pymmcore_widgets.hcs._plate_calibration_widget import CalibrationMode
+
+    wdg = PlateCalibrationWidget(mmcore=global_mmcore)
+    wdg.show()
+    qtbot.addWidget(wdg)
+    wdg.setValue("96-well")
+    wdg.setCalibrationMode(CalibrationMode.TWO_POINT)
+
+    spacing = 9000.0
+    a1 = (1000.0, 2000.0)
+    for (row, col), center in {
+        (0, 0): a1,
+        (0, 11): (a1[0] + 11 * spacing, a1[1]),
+    }.items():
+        wdg._plate_view.setSelectedIndices({(row, col)})
+        with wait_signal(qtbot, wdg.calibrationChanged):
+            wdg._current_calibration_widget().setWellCenter(center)
+
+    value = wdg.value()
+    assert value is not None
+    assert value.a1_center_xy == pytest.approx(a1, abs=0.01)
+    # the column spacing was measured, the row spacing came from the plate
+    assert wdg._well_spacing == pytest.approx((9.0, 9.0), abs=0.001)
