@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,48 @@ if TYPE_CHECKING:
 OK_CANCEL = QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
 NULL_SEQUENCE = useq.MDASequence()
 MAX = 9999999
+
+# a well id such as "B7", or "AA12" on plates with more than 26 rows
+WELL_ID = re.compile(r"^\s*([A-Za-z]{1,3})\s*(\d{1,3})\s*$")
+
+
+def well_id(plate_row: int, plate_col: int) -> str:
+    """Return the human readable id of a well, e.g. (1, 6) -> "B7".
+
+    Uses the spreadsheet convention that both useq-schema and the OME-Zarr
+    writers use, so rows continue past Z as AA, AB, ... (a 1536 well plate ends
+    at row "AF").
+    """
+    name, index = "", plate_row
+    while index >= 0:
+        name = chr(index % 26 + 65) + name
+        index = index // 26 - 1
+    return f"{name}{plate_col + 1}"
+
+
+def well_indices(well: str) -> tuple[int, int] | None:
+    """Return the (row, column) indices of a well id, or None if unparsable.
+
+    The inverse of `well_id`: "B7" -> (1, 6).
+    """
+    if not (match := WELL_ID.match(well or "")):
+        return None
+    letters, digits = match.groups()
+    row = 0
+    for char in letters.upper():
+        row = row * 26 + (ord(char) - 64)
+    col = int(digits)
+    if col < 1:
+        return None
+    return row - 1, col - 1
+
+
+WELL_TOOLTIP = (
+    "The well this position belongs to, e.g. 'B7'.\n"
+    "Stored on the position as plate_row/plate_col, which is what ends up in "
+    "the plate/well hierarchy of an OME-Zarr dataset.\n"
+    "The column appears as soon as any position has a well."
+)
 AF_PER_POS_TOOLTIP = (
     "If checked, the user can set a different Hardware Autofocus Offset for each "
     "Position in the table."
@@ -162,6 +205,7 @@ class PositionTable(DataTableWidget):
     """Table to edit a list of [useq.Position](https://pymmcore-plus.github.io/useq-schema/schema/axes/#useq.Position)."""
 
     NAME = TextColumn(key="name", default=None, is_row_selector=True)
+    WELL = TextColumn(key="well", header="Well", default=None, hidden=True)
     X = FloatColumn(key="x", header="X [µm]", default=0.0, maximum=MAX, minimum=-MAX)
     Y = FloatColumn(key="y", header="Y [µm]", default=0.0, maximum=MAX, minimum=-MAX)
     Z = FloatColumn(key="z", header="Z [µm]", default=0.0, maximum=MAX, minimum=-MAX)
@@ -188,6 +232,11 @@ class PositionTable(DataTableWidget):
         self.af_per_position.setToolTip(AF_PER_POS_TOOLTIP)
         self.af_per_position.toggled.connect(self._on_af_per_position_toggled)
         self._on_af_per_position_toggled(self.af_per_position.isChecked())
+
+        # reveal the Well column as soon as anything writes a well into it
+        if header := self.table().horizontalHeaderItem(self.table().indexOf(self.WELL)):
+            header.setToolTip(WELL_TOOLTIP)
+        self.valueChanged.connect(self._update_well_column_visibility)
 
         self._save_button = QPushButton("Save...")
         self._save_button.clicked.connect(self.save)
@@ -236,6 +285,13 @@ class PositionTable(DataTableWidget):
         ):
             if not r.get(self.NAME.key, True):
                 r.pop(self.NAME.key, None)
+
+            # the Well column is a display form of plate_row/plate_col, which is
+            # what useq (and the OME-Zarr writers) actually store
+            if (well := r.pop(self.WELL.key, None)) and (
+                indices := well_indices(str(well))
+            ):
+                r["plate_row"], r["plate_col"] = indices
 
             if self.af_per_position.isChecked() and self.af_per_position.isEnabled():
                 af_offset = r.get(self.AF.key, None)
@@ -309,12 +365,17 @@ class PositionTable(DataTableWidget):
 
                 _use_af = True
 
-            _values.append({**v.model_dump(exclude_unset=True), **_af})
+            _well = {}
+            if v.plate_row is not None and v.plate_col is not None:
+                _well = {self.WELL.key: well_id(v.plate_row, v.plate_col)}
+
+            _values.append({**v.model_dump(exclude_unset=True), **_af, **_well})
 
         super().setValue(_values)
         with signals_blocked(self):
             self.include_z.setChecked(_include_z)
             self.af_per_position.setChecked(_use_af)
+        self._update_well_column_visibility(allow_hide=True)
 
     def save(self, file: str | Path | None = None) -> None:
         """Save the current positions to a JSON file."""
@@ -369,6 +430,23 @@ class PositionTable(DataTableWidget):
                     continue
             self._set_row_xy_enabled(row, enabled, tip)
 
+    def wellColumnVisible(self) -> bool:
+        """Return True if the Well column is currently shown."""
+        return not self.table().isColumnHidden(self.table().indexOf(self.WELL))
+
+    def setWellColumnVisible(self, visible: bool) -> None:
+        """Show or hide the Well column.
+
+        The column is shown automatically as soon as any position has a well,
+        and hidden again when none does, so this is only needed to reveal it in
+        order to type wells in by hand.
+        """
+        col = self.table().indexOf(self.WELL)
+        if self.table().isColumnHidden(col) == (not visible):
+            return
+        self.table().setColumnHidden(col, not visible)
+        self.valueChanged.emit()
+
     # ------------------- sub-sequence grid helpers -------------------
 
     def _on_table_rows_inserted(self, parent: object, start: int, end: int) -> None:
@@ -414,6 +492,22 @@ class PositionTable(DataTableWidget):
                 wdg.setToolTip(tip)
 
     # ------------------------- Private API -------------------------
+
+    def _update_well_column_visibility(self, allow_hide: bool = False) -> None:
+        """Show the Well column as soon as any row has a well.
+
+        Hiding again only happens when the whole list is replaced (`allow_hide`),
+        never while the user is editing: clearing the last well by hand would
+        otherwise pull the column out from under the cursor.
+        """
+        table = self.table()
+        col = table.indexOf(self.WELL)
+        has_well = any(
+            (item := table.item(row, col)) is not None and bool(item.text().strip())
+            for row in range(table.rowCount())
+        )
+        if has_well or allow_hide:
+            table.setColumnHidden(col, not has_well)
 
     def _on_include_z_toggled(self, checked: bool) -> None:
         z_col = self.table().indexOf(self.Z)

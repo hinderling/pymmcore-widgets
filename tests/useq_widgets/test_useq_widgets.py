@@ -647,3 +647,67 @@ def test_mda_popup_with_polygon(qtbot: QtBot) -> None:
     assert gp._mode_btn_group.checkedButton().text() == "Polygon"
     assert gp.polygon_wdg.scene is not None
     assert gp.polygon_wdg.scene.items()
+
+
+def test_well_id_helpers() -> None:
+    """Well ids follow the spreadsheet convention used by useq and ome-writers."""
+    from pymmcore_widgets.useq_widgets._positions import well_id, well_indices
+
+    for row, col, expected in [
+        (0, 0, "A1"),
+        (1, 6, "B7"),
+        (25, 0, "Z1"),
+        (26, 11, "AA12"),
+        (31, 47, "AF48"),  # last well of a 1536 well plate
+    ]:
+        assert well_id(row, col) == expected
+        assert well_indices(expected) == (row, col)
+
+    # the ids match what useq itself names the wells
+    plate = useq.WellPlate.from_str("1536-well")
+    names = plate.all_well_names
+    assert well_id(0, 0) == names[0][0]
+    assert well_id(31, 47) == names[31][47]
+
+    # lenient about case and whitespace, None for anything else
+    assert well_indices(" b7 ") == (1, 6)
+    assert well_indices("nonsense") is None
+    assert well_indices("B0") is None
+    assert well_indices("") is None
+
+
+def test_position_table_well_column(qtbot: QtBot) -> None:
+    """The Well column round-trips plate_row/plate_col and shows itself when used."""
+    table = PositionTable()
+    qtbot.addWidget(table)
+    assert not table.wellColumnVisible()
+
+    table.setValue([useq.Position(x=1, y=2, name="fov0", plate_row=1, plate_col=6)])
+    assert table.wellColumnVisible()
+    assert table.table().rowData(0)["well"] == "B7"
+
+    pos = table.value()[0]
+    assert (pos.plate_row, pos.plate_col) == (1, 6)
+    assert pos.name == "fov0"  # the name is untouched by the well
+
+    # the column is editable: typing a well id updates the position
+    col = table.table().indexOf(table.WELL)
+    table.table().item(0, col).setText("c3")
+    pos = table.value()[0]
+    assert (pos.plate_row, pos.plate_col) == (2, 2)
+
+    # unparsable text simply means "no well", rather than raising
+    table.table().item(0, col).setText("???")
+    pos = table.value()[0]
+    assert pos.plate_row is None and pos.plate_col is None
+
+    # a list without wells hides the column again
+    table.setValue([useq.Position(x=0, y=0, name="a")])
+    assert not table.wellColumnVisible()
+    assert table.value()[0].plate_row is None
+
+    # ...but it can be revealed to type wells in by hand
+    table.setWellColumnVisible(True)
+    assert table.wellColumnVisible()
+    table.table().item(0, col).setText("D4")
+    assert (table.value()[0].plate_row, table.value()[0].plate_col) == (3, 3)
