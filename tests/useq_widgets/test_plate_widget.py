@@ -114,3 +114,20 @@ def test_plate_mouse_press(qtbot: QtBot) -> None:
     with qtbot.waitSignal(wdg._view.selectionChanged):
         wdg._view._on_rubber_band_changed(wdg.rect())
     assert len(wdg._view._selected_items) == 0
+
+
+def test_pen_width_scales_with_plate() -> None:
+    """Small custom plates must not be drawn with a pen wider than their wells."""
+    from pymmcore_widgets.useq_widgets._well_plate_widget import _scaled_pen_width
+
+    # standard plates keep the pen width they have always been drawn with
+    assert _scaled_pen_width(useq.WellPlate.from_str("96-well")) == 200
+    for name in useq.registered_well_plate_keys():
+        plate = useq.WellPlate.from_str(name)
+        assert 1 <= _scaled_pen_width(plate) < plate.well_size[0] * 1000 / 2
+
+    # a plate of a few hundred µm gets a pen scaled down to match
+    mini = useq.WellPlate(
+        rows=2, columns=3, well_spacing=(0.11, 0.11), well_size=(0.085, 0.085)
+    )
+    assert 1 <= _scaled_pen_width(mini) < 85 / 2

@@ -47,6 +47,23 @@ DATA_INDEX = 2
 DATA_SELECTED = 3
 DATA_COLOR = 4
 
+# divisor chosen so that the standard plates (which all have roughly the same
+# extent) keep the 200 µm pen width that has always been used for them
+_PEN_WIDTH_DIVISOR = 527
+
+
+def _scaled_pen_width(plate: useq.WellPlate) -> int:
+    """Return a pen width in µm suited to the size of `plate`.
+
+    Scaled to the extent of the plate rather than fixed, so that plates much
+    smaller than a standard SBS one (e.g. a custom slide of a few hundred µm)
+    are not drawn with a pen wider than their own wells.
+    """
+    extent_x = (plate.columns - 1) * plate.well_spacing[0] * 1000 + (
+        plate.well_size[0] * 1000
+    )
+    return max(1, int(extent_x / _PEN_WIDTH_DIVISOR))
+
 
 class WellPlateWidget(QWidget):
     """Widget for selecting a well plate and a subset of wells.
@@ -432,11 +449,10 @@ class WellPlateView(ResizingGraphicsView):
 
         # font for well labels
         font = QFont()
-        font.setPixelSize(int(min(6000, well_rect.width() / 2.5)))
+        font.setPixelSize(max(1, int(min(6000, well_rect.width() / 2.5))))
 
-        # Since most plates have the same extent, a constant pen width seems to work
         pen = QPen(Qt.GlobalColor.black)
-        pen.setWidth(200)
+        pen.setWidth(_scaled_pen_width(plan.plate))
 
         self.clear()
         indices = plan.all_well_indices.reshape(-1, 2)
