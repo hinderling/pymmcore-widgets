@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import TYPE_CHECKING, cast
 
 import cmap
@@ -7,7 +8,7 @@ import numpy as np
 import vispy
 import vispy.scene
 import vispy.visuals
-from qtpy.QtCore import Qt
+from qtpy.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from qtpy.QtWidgets import QLabel, QVBoxLayout, QWidget
 from vispy import scene
 from vispy.scene.visuals import Image
@@ -25,6 +26,16 @@ if TYPE_CHECKING:
 class StageViewer(QWidget):
     """A widget to add images with a transform to a vispy canves."""
 
+    # Emitted around a Qt reparent (e.g. floating/redocking a dock widget that
+    # contains this viewer) that recreates the underlying QOpenGLWidget's GL
+    # context. vispy has no context-loss recovery: afterward the old visuals are
+    # bound to invalid GL objects. On ``glContextAboutToReset`` owners should
+    # hide/stop drawing their visuals; on ``glContextReset`` they should rebuild
+    # them (construct fresh visuals so new GL objects are created on the live
+    # context). This viewer rebuilds its own grid lines; owners rebuild theirs.
+    glContextAboutToReset = Signal()
+    glContextReset = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Stage Explorer")
@@ -38,17 +49,19 @@ class StageViewer(QWidget):
         self.view = cast("ViewBox", self.canvas.central_widget.add_view())
         self.view.camera = scene.PanZoomCamera(aspect=1)
 
-        self._grid_lines = vispy.scene.GridLines(
-            parent=self.view.scene,
-            color="#888888",
-            border_width=1,
-        )
-        self._grid_lines.visible = False
+        self._grid_visible = False
+        self._create_grid()
 
         main_layout = QVBoxLayout(self)
         main_layout.setSpacing(0)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.addWidget(self.canvas.native)
+
+        # Watch the native GL widget for the reparent that recreates its GL
+        # context (napari does not forward hide/show to a floated dock's
+        # content, so we watch the canvas widget itself, not this QWidget).
+        self._gl_reset_pending = False
+        self.canvas.native.installEventFilter(self)
 
         self._show_hover_label = True
         self._hover_pos_label = QLabel(self)
@@ -57,6 +70,45 @@ class StageViewer(QWidget):
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
         )
         self.canvas.events.mouse_move.connect(self._on_mouse_move)
+
+    # --------------------GL CONTEXT RESET (reparent)--------------------
+
+    def _create_grid(self) -> None:
+        self._grid_lines = vispy.scene.GridLines(
+            parent=self.view.scene, color="#888888", border_width=1
+        )
+        self._grid_lines.visible = self._grid_visible
+
+    def eventFilter(self, obj: QObject | None, event: QEvent | None) -> bool:
+        """Detect the QOpenGLWidget context reset caused by a Qt reparent."""
+        if obj is self.canvas.native and event is not None:
+            et = event.type()
+            if et == QEvent.Type.Hide:
+                self._suspend_gl()
+            elif et in (QEvent.Type.Show, QEvent.Type.WinIdChange):
+                # Hide visuals NOW (synchronously, before the imminent paintGL
+                # draws them against dead handles), even if no Hide was seen.
+                self._suspend_gl()
+                if not self._gl_reset_pending:
+                    # Rebuild deferred: the new context is created lazily on the
+                    # next paintGL, so fresh CREATE commands must wait for it.
+                    self._gl_reset_pending = True
+                    QTimer.singleShot(0, self._do_gl_reset)
+        return super().eventFilter(obj, event)
+
+    def _suspend_gl(self) -> None:
+        with suppress(Exception):
+            self._grid_lines.visible = False
+        self.glContextAboutToReset.emit()
+
+    def _do_gl_reset(self) -> None:
+        self._gl_reset_pending = False
+        # rebuild our own grid (fresh gloo objects on the new context)...
+        with suppress(Exception):
+            self._grid_lines.parent = None
+        self._create_grid()
+        # ...then let owners rebuild their overlays/markers.
+        self.glContextReset.emit()
 
     # --------------------PUBLIC METHODS--------------------
 
@@ -68,6 +120,7 @@ class StageViewer(QWidget):
             child.clim = value
 
     def set_grid_visible(self, visible: bool) -> None:
+        self._grid_visible = visible
         self._grid_lines.visible = visible
 
     def add_image(self, img: np.ndarray, transform: np.ndarray | None = None) -> None:

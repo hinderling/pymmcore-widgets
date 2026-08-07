@@ -6,6 +6,7 @@ inversion, unlike the Qt-graphics based WellPlateView).
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -106,12 +107,26 @@ class WellPlateOverlay:
     """Well outlines, plate boundary and well labels drawn in stage coordinates."""
 
     def __init__(self, parent: Node, face: str = "OpenSans") -> None:
-        self._outlines = scene.visuals.Line(parent=parent, width=1)
+        self._parent = parent
+        self._face = face
+        self._show_labels = True
+        self._has_labels = False
+        self._outline_color: ColorLike = CALIBRATED_COLOR
+        self._label_color: ColorLike = CALIBRATED_COLOR
+        self._calibrated = True
+        self._create_visuals()
+
+    def _create_visuals(self) -> None:
+        self._outlines = scene.visuals.Line(parent=self._parent, width=1)
         self._outlines.order = ORDER_PLATE
-        self._border = scene.visuals.Line(parent=parent, width=1)
+        self._border = scene.visuals.Line(parent=self._parent, width=1)
         self._border.order = ORDER_PLATE
         self._labels = scene.visuals.Text(
-            parent=parent, font_size=8, anchor_x="center", anchor_y="center", face=face
+            parent=self._parent,
+            font_size=8,
+            anchor_x="center",
+            anchor_y="center",
+            face=self._face,
         )
         self._labels.order = ORDER_LABELS
         for vis in (self._outlines, self._border, self._labels):
@@ -120,11 +135,24 @@ class WellPlateOverlay:
             vis.set_gl_state(**BLEND_STATE)
             vis.visible = False
 
-        self._show_labels = True
+    def rebuild(self) -> None:
+        """Recreate the vispy visuals with fresh gloo objects.
+
+        A GL-context reset (Qt reparent -- e.g. a dock float) leaves the old
+        visuals bound to dead GL handles; vispy has no re-upload path, so the
+        only recovery is to drop them and build new ones. The caller must
+        re-populate afterward (set_plan / set_colors / set_labels_visible).
+        """
+        for vis in (self._outlines, self._border, self._labels):
+            with suppress(Exception):
+                vis.parent = None
+        self._create_visuals()
         self._has_labels = False
-        self._outline_color: ColorLike = CALIBRATED_COLOR
-        self._label_color: ColorLike = CALIBRATED_COLOR
-        self._calibrated = True
+
+    def hide(self) -> None:
+        """Hide every sub-visual without touching cached state (GL suspend)."""
+        for vis in (self._outlines, self._border, self._labels):
+            vis.visible = False
 
     # ----------------------------- public API -----------------------------
 
@@ -251,10 +279,18 @@ class PositionsOverlay:
     """Stage positions (markers + FOV rectangles), travel path and name labels."""
 
     def __init__(self, parent: Node, face: str = "OpenSans") -> None:
-        self._fovs = scene.visuals.Line(parent=parent, width=1)
+        self._parent = parent
+        self._face = face
+        self._show_trail = True
+        self._show_labels = True
+        self._n_positions = 0
+        self._create_visuals()
+
+    def _create_visuals(self) -> None:
+        self._fovs = scene.visuals.Line(parent=self._parent, width=1)
         self._fovs.order = ORDER_FOVS
         self._trail = scene.visuals.Arrow(
-            parent=parent,
+            parent=self._parent,
             connect="strip",
             width=1.5,
             arrow_type="stealth",
@@ -266,20 +302,37 @@ class PositionsOverlay:
         # unset, which crashes bounds computations on camera.set_range), so an
         # invisible dummy point is used whenever there are no positions
         self._markers = scene.visuals.Markers(
-            parent=parent, scaling="fixed", pos=np.zeros((1, 2)), size=0
+            parent=self._parent, scaling="fixed", pos=np.zeros((1, 2)), size=0
         )
         self._markers.order = ORDER_MARKERS
         self._labels = scene.visuals.Text(
-            parent=parent, font_size=9, anchor_x="center", anchor_y="top", face=face
+            parent=self._parent,
+            font_size=9,
+            anchor_x="center",
+            anchor_y="top",
+            face=self._face,
         )
         self._labels.order = ORDER_LABELS
         for vis in (self._fovs, self._trail, self._markers, self._labels):
             vis.set_gl_state(**BLEND_STATE)
             vis.visible = False
 
-        self._show_trail = True
-        self._show_labels = True
+    def rebuild(self) -> None:
+        """Recreate the vispy visuals with fresh gloo objects (post GL reset).
+
+        See WellPlateOverlay.rebuild. The caller must re-populate afterward via
+        set_positions / set_trail_visible / set_labels_visible.
+        """
+        for vis in (self._fovs, self._trail, self._markers, self._labels):
+            with suppress(Exception):
+                vis.parent = None
+        self._create_visuals()
         self._n_positions = 0
+
+    def hide(self) -> None:
+        """Hide every sub-visual without touching cached state (GL suspend)."""
+        for vis in (self._fovs, self._trail, self._markers, self._labels):
+            vis.visible = False
 
     # ----------------------------- public API -----------------------------
 

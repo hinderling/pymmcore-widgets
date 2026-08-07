@@ -5,6 +5,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
 import useq
 from pymmcore_plus import CMMCorePlus
 from qtpy.QtCore import QEvent, QSize, Qt, Signal
@@ -28,10 +29,14 @@ from qtpy.QtWidgets import (
 )
 from superqt import QIconifyIcon
 from superqt.utils import signals_blocked
+from vispy.scene import MatrixTransform, Node
 
 from pymmcore_widgets.control._q_stage_controller import QStageMoveAccumulator
 from pymmcore_widgets.control._rois.roi_manager import GRAY
-from pymmcore_widgets.control._stage_explorer._stage_explorer import AffineState
+from pymmcore_widgets.control._stage_explorer._stage_explorer import (
+    AffineState,
+    _StagePoller,
+)
 from pymmcore_widgets.control._stage_explorer._stage_position_marker import (
     StagePositionMarker,
 )
@@ -48,7 +53,7 @@ from ._overlays import PositionsOverlay, WellPlateOverlay, nearest_well
 if TYPE_CHECKING:
     from PyQt6.QtGui import QAction
     from qtpy.QtCore import QTimerEvent
-    from qtpy.QtGui import QColor, QIcon, QShowEvent
+    from qtpy.QtGui import QCloseEvent, QColor, QIcon, QShowEvent
     from vispy.app.canvas import MouseEvent
 
     from pymmcore_widgets.control._stage_explorer._stage_viewer import VisualNode
@@ -174,6 +179,24 @@ class StageMapWidget(QWidget):
         self._stage_controller: QStageMoveAccumulator | None = None
         self._timer_id: int | None = None
         self._poll_interval_ms: int = 33
+        # True while the widget is hidden across a reparent (dock float/redock),
+        # which recreates the underlying QOpenGLWidget's GL context and
+        # invalidates every visual. While set, GL draws are skipped (drawing into
+        # the recreated context is invalid); visuals are rebuilt once shown again.
+        self._gl_suspended: bool = False
+        # Latched when teardown begins. Guards every deferred/threaded callback so
+        # none touch the canvas, core or poller while they are being destroyed.
+        self._closing: bool = False
+        # Poll the (potentially slow, serial) stage position on a BACKGROUND
+        # thread so it never blocks map drawing / zoom / pan. It emits
+        # positionChanged only when the stage actually moves; the marker + label
+        # update on the GUI thread from that signal. The GUI timer (timerEvent)
+        # is left to the cheap, zoom-dependent redraws (FOV rect + label fonts).
+        self._last_stage_pos: tuple[float, float] | None = None
+        self._stage_poller = _StagePoller(
+            self._mmc, self, interval_ms=self._poll_interval_ms
+        )
+        self._stage_poller.positionChanged.connect(self._on_stage_position_polled)
         # the position table this widget mirrors; this widget has none of its
         # own, see setPositionTable
         self._pos_table: PositionTable | None = None
@@ -187,19 +210,27 @@ class StageMapWidget(QWidget):
         self._stage_viewer = StageViewer(self)
         self._stage_viewer.setCursor(Qt.CursorShape.CrossCursor)
 
-        face = _ui_font_face()
-        self._plate_overlay = WellPlateOverlay(self._stage_viewer.view.scene, face)
-        self._positions_overlay = PositionsOverlay(self._stage_viewer.view.scene, face)
+        # A Qt reparent (dock float/redock) recreates the canvas GL context and
+        # invalidates every visual; StageViewer detects it and signals us to
+        # hide (about-to-reset) then rebuild (reset) our overlays + marker.
+        self._stage_viewer.glContextAboutToReset.connect(self._on_gl_about_to_reset)
+        self._stage_viewer.glContextReset.connect(self._on_gl_reset)
+        # PLATE-SPACE rendering. Everything (plate, positions, marker) is drawn
+        # in STAGE-µm coordinates under this node; its transform maps stage ->
+        # canonical plate space so the plate ALWAYS reads A1 top-left and the
+        # marker shows the true stage position on that fixed plate. Identity
+        # until a plan is set (see _update_plate_transform).
+        self._plate_node = Node(parent=self._stage_viewer.view.scene)
+        self._plate_node.transform = MatrixTransform()
 
-        w = self._mmc.getImageWidth() or 512
-        h = self._mmc.getImageHeight() or 512
-        self._stage_pos_marker = StagePositionMarker(
-            parent=self._stage_viewer.view.scene,
-            rect_width=w,
-            rect_height=h,
-            marker_symbol_size=min(w, h) / 10,
-        )
-        self._stage_pos_marker.visible = False
+        face = _ui_font_face()
+        self._plate_overlay = WellPlateOverlay(self._plate_node, face)
+        self._positions_overlay = PositionsOverlay(self._plate_node, face)
+
+        # Intended marker visibility (the poll toggle). Tracked separately so a
+        # reparent -- which hides then rebuilds the marker -- can restore it.
+        self._marker_visible: bool = False
+        self._build_stage_marker()
 
         # cached parameters for efficient affine calculations
         self._affine_state = AffineState(self._mmc)
@@ -369,12 +400,76 @@ class StageMapWidget(QWidget):
         ):
             self._apply_palette()
 
+    def _on_gl_about_to_reset(self) -> None:
+        """A Qt reparent is recreating the GL context (StageViewer signal).
+
+        Hide every visual: vispy draws them on each paintGL regardless of
+        updates, and drawing into the recreated context is invalid until the
+        visuals are rebuilt in _on_gl_reset.
+        """
+        if self._closing:
+            return
+        self._gl_suspended = True
+        with suppress(Exception):
+            self._stage_pos_marker.visible = False
+            self._plate_overlay.hide()
+            self._positions_overlay.hide()
+
+    def _on_gl_reset(self) -> None:
+        """The GL context has been recreated (StageViewer signal, deferred).
+
+        vispy has no re-upload path, so every visual must be reconstructed to
+        queue fresh GLIR CREATE commands against the live context; re-issuing
+        set_data onto the old visuals would keep their dead handles. After
+        rebuilding, repopulate from the widget's own state.
+        """
+        if self._closing:
+            return
+        self._plate_overlay.rebuild()
+        self._positions_overlay.rebuild()
+        self._recreate_stage_marker()
+        self._gl_suspended = False
+        # repopulate the fresh visuals from the widget's source-of-truth state
+        self._update_plate_transform()  # stage->plate node transform
+        self._apply_palette()  # overlay colors + canvas background
+        self._plate_overlay.set_plan(self._plan, calibrated=self._calibrated)
+        self._refresh_positions()
+        self._update_label_font_sizes()
+        self._stage_viewer.canvas.update()
+
     def showEvent(self, event: QShowEvent | None) -> None:
         """Bind to an existing position table the first time we are shown."""
         super().showEvent(event)
         if self._pos_table is None and not self._auto_bind_attempted:
             self._auto_bind_attempted = True
             self.bindToFirstPositionTable()
+        # resume background polling if the toggle is on (see hideEvent)
+        if self._timer_id is not None and not self._closing:
+            with suppress(Exception):
+                if not self._stage_poller.isRunning():
+                    self._stage_poller.start()
+
+    def hideEvent(self, event: QEvent | None) -> None:
+        """Stop the background poller whenever the widget is hidden.
+
+        A widget is hidden before it is destroyed, so this reliably stops the
+        poller before its QThread would be torn down (a QThread still running
+        at destruction aborts the process). It also covers dock float/redock;
+        showEvent restarts polling if the toggle is still on.
+        """
+        with suppress(Exception):
+            self._stage_poller.stop()
+        super().hideEvent(event)
+
+    def closeEvent(self, event: QCloseEvent | None) -> None:
+        """Tear down on close in addition to on destroy.
+
+        The `destroyed` signal is not always delivered to a Python slot when a
+        dock's content widget is destroyed, so run teardown here too. It stops
+        the poller before its QThread is destroyed; `_disconnect` is idempotent.
+        """
+        self._disconnect()
+        super().closeEvent(event)
 
     @property
     def poll_stage_position(self) -> bool:
@@ -577,6 +672,7 @@ class StageMapWidget(QWidget):
     def _set_plan(self, plan: useq.WellPlatePlan | None, *, calibrated: bool) -> None:
         self._plan = plan
         self._calibrated = calibrated and plan is not None
+        self._update_plate_transform()
         self._plate_overlay.set_plan(plan, calibrated=self._calibrated)
         self._update_status()
         self._update_action_enablement()
@@ -858,40 +954,94 @@ class StageMapWidget(QWidget):
         """Move the stage to the double-clicked position."""
         if self._stage_controller is None:
             return
-        x, y, *_ = self._stage_viewer.view.camera.transform.imap(event.pos)
+        # camera.imap gives canonical plate coords (view.scene space); undo the
+        # plate transform to get back the STAGE coordinate to move to.
+        plate = self._stage_viewer.view.camera.transform.imap(event.pos)
+        x, y, *_ = self._plate_node.transform.imap(plate)
         self._stage_controller.move_absolute((x, y))
         self._stage_pos_label.setText(f"X: {x:.2f} µm  Y: {y:.2f} µm")
 
     def _on_poll_stage_toggled(self, checked: bool) -> None:
+        self._marker_visible = checked
         self._stage_pos_marker.visible = checked
         if checked:
+            self._stage_poller.start()  # background position reads (off GUI thread)
             if self._timer_id is None:
+                # GUI timer: cheap, zoom-dependent redraws only (no hardware read)
                 self._timer_id = self.startTimer(self._poll_interval_ms)
-        elif self._timer_id is not None:
-            self.killTimer(self._timer_id)
-            self._timer_id = None
+        else:
+            self._stage_poller.stop()
+            if self._timer_id is not None:
+                self.killTimer(self._timer_id)
+                self._timer_id = None
 
-    def timerEvent(self, event: QTimerEvent | None) -> None:
-        """Poll the stage position and update the marker and the label."""
-        if not self._mmc.getXYStageDevice():
-            self._stage_pos_label.setText("No XY stage device")
+    def _on_stage_position_polled(self, stage_x: float, stage_y: float) -> None:
+        """Update the marker + label from a background-polled stage position.
+
+        Runs on the GUI thread (queued from the poller thread) and only fires
+        when the stage actually moved, so it neither blocks nor churns the map.
+        """
+        if self._closing:  # a signal may already be queued when close begins
             return
-
-        stage_x, stage_y = self._mmc.getXYPosition()
+        self._last_stage_pos = (stage_x, stage_y)
         txt = f"X: {stage_x:.2f} µm  Y: {stage_y:.2f} µm"
         if self._calibrated and self._plan is not None:
             hit = nearest_well(self._plan, stage_x, stage_y)
             if hit.inside:
                 txt += f"   [{hit.name}]"
         self._stage_pos_label.setText(txt)
-
+        # skip the GL marker draw across a reparent (context torn down); the
+        # position is recorded above and re-applied by _on_gl_reset() on show.
+        if self._gl_suspended:
+            return
         # fast path: copy cached rotation/scale part and just update translation
         matrix = self._affine_state.system_affine_translated(stage_x, stage_y)
         self._stage_pos_marker.apply_transform(matrix.T)
 
-        # cheap in-memory reads; catches field of view changes that emit no event
+    def timerEvent(self, event: QTimerEvent | None) -> None:
+        """Cheap, zoom-dependent redraws only (FOV rect + label font sizes).
+
+        The stage position is read off the GUI thread by ``_stage_poller`` and
+        applied in ``_on_stage_position_polled``, so map drawing/zoom/pan is
+        never blocked by a (slow, serial) stage read.
+        """
+        if self._gl_suspended or self._closing:  # reparent / teardown in flight
+            return
+        if not self._mmc.getXYStageDevice():
+            self._stage_pos_label.setText("No XY stage device")
+            return
+        # cheap in-memory reads; catch field-of-view / zoom changes (no event)
         self._update_fov_size()
         self._update_label_font_sizes()
+
+    def _build_stage_marker(self) -> None:
+        """Create the stage-position marker on the scene (fresh GL program)."""
+        w = self._mmc.getImageWidth() or 512
+        h = self._mmc.getImageHeight() or 512
+        self._stage_pos_marker = StagePositionMarker(
+            parent=self._plate_node,
+            rect_width=w,
+            rect_height=h,
+            marker_symbol_size=min(w, h) / 10,
+        )
+        self._stage_pos_marker.visible = self._marker_visible
+
+    def _recreate_stage_marker(self) -> None:
+        """Drop the old marker and build a fresh one after a GL-context reset.
+
+        vispy's Markers visual does not survive the QOpenGLWidget context
+        recreation on reparent. Detaching the old visual and constructing a new
+        one compiles a fresh GL program on the current context.
+        """
+        old = self._stage_pos_marker
+        old.visible = False
+        with suppress(Exception):
+            old.parent = None  # remove the broken visual from the scene
+        self._build_stage_marker()
+        if self._marker_visible and self._last_stage_pos is not None:
+            x, y = self._last_stage_pos
+            matrix = self._affine_state.system_affine_translated(x, y)
+            self._stage_pos_marker.apply_transform(matrix.T)
 
     # CORE EVENTS -------------------------------------------------------------
 
@@ -904,6 +1054,31 @@ class StageMapWidget(QWidget):
         self._last_fov_size = None
         self._refresh_positions()
 
+    def _update_plate_transform(self) -> None:
+        """Set the stage->plate transform so the plate draws canonically.
+
+        Everything under ``_plate_node`` is drawn in STAGE-µm coordinates; this
+        maps them to canonical plate space, exactly the local frame ``nearest_well``
+        uses: ``local = R(-rotation) @ (stage - a1_center)`` (columns -> +x, rows
+        -> -y), so A1 is always top-left regardless of how the stage axes are
+        wired. The marker (drawn at the raw stage position) is mapped by the same
+        transform, so it shows the TRUE position on the fixed plate -- if the
+        calibration/axes are wrong the marker is visibly off, rather than the
+        plate silently rotating. Identity when there is no plan (plain stage
+        space), which is also what an uncalibrated preview (a1=0, rot=0) yields.
+        """
+        m = np.eye(4)
+        if (plan := self._plan) is not None:
+            theta = np.deg2rad(plan.rotation or 0.0)
+            cos_, sin_ = np.cos(-theta), np.sin(-theta)
+            rot = np.array([[cos_, -sin_], [sin_, cos_]])  # R(-rotation)
+            a1 = np.asarray(plan.a1_center_xy, dtype=float)
+            m[:2, :2] = rot
+            m[:2, 3] = -rot @ a1
+        # vispy MatrixTransform uses row-vector convention (out = in @ M), so
+        # pass the transpose of our column-convention matrix (as apply_transform).
+        self._plate_node.transform = MatrixTransform(matrix=m.T)
+
     def _on_pixel_size_changed(self, value: float = 0.0) -> None:
         self._affine_state.refresh()
         self._update_fov_size()
@@ -912,10 +1087,31 @@ class StageMapWidget(QWidget):
         self._update_fov_size()
 
     def _disconnect(self) -> None:
+        # Idempotent: both closeEvent and the `destroyed` signal may call this,
+        # so whichever runs first tears down and the other is a no-op.
+        if getattr(self, "_disconnected", False):
+            return
+        self._disconnected = True
+        # Latch teardown first so any already-queued deferred redraw / poller
+        # signal / timer tick becomes a no-op instead of touching a dying
+        # canvas or core.
+        self._closing = True
+        # Stop the background thread before its C++ object is destroyed with the
+        # widget; a QThread still running at destruction aborts the process.
+        with suppress(Exception):
+            self._stage_poller.stop()
+        if self._timer_id is not None:
+            with suppress(Exception):
+                self.killTimer(self._timer_id)
+            self._timer_id = None
         events = self._mmc.events
-        events.systemConfigurationLoaded.disconnect(self._on_sys_config_loaded)
-        events.pixelSizeChanged.disconnect(self._on_pixel_size_changed)
-        events.roiSet.disconnect(self._on_roi_changed)
+        for sig, slot in (
+            (events.systemConfigurationLoaded, self._on_sys_config_loaded),
+            (events.pixelSizeChanged, self._on_pixel_size_changed),
+            (events.roiSet, self._on_roi_changed),
+        ):
+            with suppress(Exception):
+                sig.disconnect(slot)
 
 
 class _PlateCalibrationDialog(QDialog):

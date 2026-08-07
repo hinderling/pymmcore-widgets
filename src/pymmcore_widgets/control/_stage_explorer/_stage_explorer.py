@@ -53,9 +53,15 @@ class _StagePoller(QThread):
 
     positionChanged = Signal(float, float)
 
-    def __init__(self, mmc: CMMCorePlus, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        mmc: CMMCorePlus,
+        parent: QWidget | None = None,
+        interval_ms: int = STAGE_POLL_INTERVAL_MS,
+    ) -> None:
         super().__init__(parent)
         self._mmc = mmc
+        self._interval_ms = int(interval_ms)
 
     def run(self) -> None:
         """Poll the stage position.
@@ -70,15 +76,21 @@ class _StagePoller(QThread):
                 if last is not None:
                     dx, dy = x - last[0], y - last[1]
                     if dx * dx + dy * dy < STAGE_POS_TOLERANCE_UM_SQ:
-                        self.msleep(STAGE_POLL_INTERVAL_MS)
+                        self.msleep(self._interval_ms)
                         continue
                 last = (x, y)
                 self.positionChanged.emit(x, y)
-            self.msleep(STAGE_POLL_INTERVAL_MS)
+            self.msleep(self._interval_ms)
 
     def stop(self) -> None:
         self.requestInterruption()
-        self.wait()
+        # Bounded: the run loop may be blocked in a slow/stuck getXYPosition
+        # (e.g. a stage with a sticky Busy flag), so never wait forever on
+        # teardown. Force-terminate as a last resort -- the loop only does
+        # read-only position reads, so this is safe on shutdown.
+        if not self.wait(3000):
+            self.terminate()
+            self.wait()
 
 
 # this might belong in _stage_position_marker.py
@@ -957,8 +969,13 @@ class AffineState:
         cos_ = np.cos(rotation_rad)
         sin_ = np.sin(rotation_rad)
         R[:2, :2] = np.array([[cos_, -sin_], [sin_, cos_]])
-        # scaling matrix
-        S = np.diag([self.pixel_size_um, self.pixel_size_um, 1, 1])
+        # scaling matrix. Fall back to 1 um/px when the pixel size is uncalibrated
+        # (0): a 0 scale makes the 2x2 linear block singular, which collapses the
+        # stage-position marker onto the origin. Only the FOV rectangle *size*
+        # should depend on the (missing) calibration -- the marker *location* must
+        # still track the stage, so keep the transform non-singular.
+        scale = self.pixel_size_um or 1.0
+        S = np.diag([scale, scale, 1, 1])
         # flip the image if required
         if flip_x:
             S[0, 0] *= -1
