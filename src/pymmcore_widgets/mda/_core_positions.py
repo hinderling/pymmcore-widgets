@@ -493,6 +493,16 @@ class CoreConnectedPositionTable(PositionTable):
         if not (pos_list := self.value()):
             return
 
+        # Only grid-plan sub-sequences depend on the FOV size. If nothing has a
+        # grid plan there is nothing to update, and we must NOT fall through to
+        # the value()/setValue round-trip below: rebuilding the whole table can
+        # drop x/y from otherwise-fine positions (e.g. on the pixelSizeChanged
+        # fired by switching objectives), zeroing manually-entered positions.
+        if not any(
+            getattr(p.sequence, "grid_plan", None) is not None for p in pos_list
+        ):
+            return
+
         # get updated FOV size
         px = self._mmc.getPixelSizeUm()
         fov_w = self._mmc.getImageWidth() * px
