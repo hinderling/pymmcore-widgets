@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 import useq
 from pymmcore_plus import CMMCorePlus
-from qtpy.QtCore import QEvent, QSize, Qt, Signal
+from qtpy.QtCore import QEvent, QItemSelectionModel, QSize, Qt, Signal
 from qtpy.QtGui import QFontInfo, QPalette
 from qtpy.QtWidgets import (
     QApplication,
@@ -48,11 +48,18 @@ from pymmcore_widgets.useq_widgets._positions import PositionTable, well_id
 from pymmcore_widgets.useq_widgets._well_plate_widget import _sort_plate
 
 from ._calibration_store import PlateCalibrationStore
-from ._overlays import PositionsOverlay, WellPlateOverlay, nearest_well
+from ._overlays import (
+    SELECTED_COLOR_DARK_BG,
+    SELECTED_COLOR_LIGHT_BG,
+    PositionsOverlay,
+    WellPlateOverlay,
+    nearest_well,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from PyQt6.QtGui import QAction
-    from qtpy.QtCore import QTimerEvent
     from qtpy.QtGui import QCloseEvent, QColor, QIcon, QShowEvent
     from vispy.app.canvas import MouseEvent
 
@@ -177,7 +184,9 @@ class StageMapWidget(QWidget):
         self._custom_plates: dict[str, useq.WellPlate] = {}
 
         self._stage_controller: QStageMoveAccumulator | None = None
-        self._timer_id: int | None = None
+        # whether the poll toggle is on (the poller itself may be paused while
+        # the widget is hidden, see hideEvent/showEvent)
+        self._polling: bool = False
         self._poll_interval_ms: int = 33
         # True while the widget is hidden across a reparent (dock float/redock),
         # which recreates the underlying QOpenGLWidget's GL context and
@@ -190,13 +199,16 @@ class StageMapWidget(QWidget):
         # Poll the (potentially slow, serial) stage position on a BACKGROUND
         # thread so it never blocks map drawing / zoom / pan. It emits
         # positionChanged only when the stage actually moves; the marker + label
-        # update on the GUI thread from that signal. The GUI timer (timerEvent)
-        # is left to the cheap, zoom-dependent redraws (FOV rect + label fonts).
+        # update on the GUI thread from that signal. There is NO GUI-side
+        # timer: label fonts rescale from the canvas draw event, so an open
+        # map costs the GUI thread nothing while it is not being interacted
+        # with.
         self._last_stage_pos: tuple[float, float] | None = None
         self._stage_poller = _StagePoller(
-            self._mmc, self, interval_ms=self._poll_interval_ms
+            self._mmc, self, interval_ms=self._poll_interval_ms, poll_fov=True
         )
         self._stage_poller.positionChanged.connect(self._on_stage_position_polled)
+        self._stage_poller.fovChanged.connect(self._on_fov_polled)
         # the position table this widget mirrors; this widget has none of its
         # own, see setPositionTable
         self._pos_table: PositionTable | None = None
@@ -204,6 +216,13 @@ class StageMapWidget(QWidget):
         self._calib_dialog: _PlateCalibrationDialog | None = None
         # last field of view size used to draw the position rectangles
         self._last_fov_size: tuple[float, float] | None = None
+        # stage-µm coordinates of the drawn positions (for click hit tests)
+        self._pos_xy: np.ndarray | None = None
+        # last zoom the label fonts were sized for; None forces a resize
+        self._last_px_per_um: float | None = None
+        # camera rect of the last zoom_to_fit; while the camera still matches
+        # it, a canvas resize triggers a re-fit (see _on_canvas_resize)
+        self._fit_rect: tuple[float, float, float, float] | None = None
 
         # WIDGETS ------------------------------------------------------------
 
@@ -220,17 +239,11 @@ class StageMapWidget(QWidget):
         # canonical plate space so the plate ALWAYS reads A1 top-left and the
         # marker shows the true stage position on that fixed plate. Identity
         # until a plan is set (see _update_plate_transform).
-        self._plate_node = Node(parent=self._stage_viewer.view.scene)
-        self._plate_node.transform = MatrixTransform()
-
-        face = _ui_font_face()
-        self._plate_overlay = WellPlateOverlay(self._plate_node, face)
-        self._positions_overlay = PositionsOverlay(self._plate_node, face)
-
-        # Intended marker visibility (the poll toggle). Tracked separately so a
-        # reparent -- which hides then rebuilds the marker -- can restore it.
+        self._font_face = _ui_font_face()
+        # Intended marker visibility (the poll toggle). Tracked separately so
+        # a reparent, which hides then rebuilds the marker, can restore it.
         self._marker_visible: bool = False
-        self._build_stage_marker()
+        self._build_scene()
 
         # cached parameters for efficient affine calculations
         self._affine_state = AffineState(self._mmc)
@@ -284,7 +297,9 @@ class StageMapWidget(QWidget):
         tb.export_action.triggered.connect(self._export_calibration)
         tb.delete_action.triggered.connect(self._delete_calibration)
         tb.assign_action.triggered.connect(self.assign_wells_to_positions)
-        tb.trails_action.toggled.connect(self._positions_overlay.set_trail_visible)
+        # via a widget method, NOT the overlay's bound method: _build_scene
+        # replaces the overlay object on every GL reset
+        tb.trails_action.toggled.connect(self._on_trails_toggled)
         tb.labels_action.toggled.connect(self._on_labels_toggled)
         tb.poll_action.toggled.connect(self._on_poll_stage_toggled)
         tb.grid_action.toggled.connect(self._stage_viewer.set_grid_visible)
@@ -294,10 +309,13 @@ class StageMapWidget(QWidget):
         self._mmc.events.systemConfigurationLoaded.connect(self._on_sys_config_loaded)
         self._mmc.events.pixelSizeChanged.connect(self._on_pixel_size_changed)
         self._mmc.events.roiSet.connect(self._on_roi_changed)
+        self._mmc.events.propertyChanged.connect(self._on_property_changed)
+        # commanded moves report through the core callback instantly; the
+        # background poller only backstops moves the adapter never reports
+        # (e.g. joystick on a serial stage)
+        self._mmc.events.XYStagePositionChanged.connect(self._on_xy_event)
 
-        self._stage_viewer.canvas.events.mouse_double_click.connect(
-            self._on_mouse_double_click
-        )
+        self._connect_canvas_events()
 
         self.destroyed.connect(self._disconnect)
 
@@ -342,11 +360,17 @@ class StageMapWidget(QWidget):
             with suppress(RuntimeError, TypeError):
                 self._pos_table.valueChanged.disconnect(self._refresh_positions)
                 self._pos_table.destroyed.disconnect(self._on_table_destroyed)
+                self._pos_table.table().itemSelectionChanged.disconnect(
+                    self._sync_selection_from_table
+                )
 
         self._pos_table = table
         if table is not None:
             table.valueChanged.connect(self._refresh_positions)
             table.destroyed.connect(self._on_table_destroyed)
+            table.table().itemSelectionChanged.connect(
+                self._sync_selection_from_table
+            )
 
         self._update_source_label()
         self._update_action_enablement()
@@ -415,25 +439,61 @@ class StageMapWidget(QWidget):
             self._plate_overlay.hide()
             self._positions_overlay.hide()
 
-    def _on_gl_reset(self) -> None:
-        """The GL context has been recreated (StageViewer signal, deferred).
+    def _build_scene(self) -> None:
+        """Create the plate node, overlays and marker on the CURRENT canvas."""
+        self._plate_node = Node(parent=self._stage_viewer.view.scene)
+        self._plate_node.transform = MatrixTransform()
+        self._plate_overlay = WellPlateOverlay(self._plate_node, self._font_face)
+        self._positions_overlay = PositionsOverlay(self._plate_node, self._font_face)
+        self._build_stage_marker()
 
-        vispy has no re-upload path, so every visual must be reconstructed to
-        queue fresh GLIR CREATE commands against the live context; re-issuing
-        set_data onto the old visuals would keep their dead handles. After
-        rebuilding, repopulate from the widget's own state.
+    def _connect_canvas_events(self) -> None:
+        """(Re)connect to the CURRENT canvas's events.
+
+        Called at construction and after every GL reset: on a reparent the
+        StageViewer replaces the whole canvas, and connections made on the old
+        one die with it.
+        """
+        canvas = self._stage_viewer.canvas
+        canvas.events.mouse_double_click.connect(self._on_mouse_double_click)
+        canvas.events.mouse_release.connect(self._on_mouse_release)
+        # zoom/pan/resize all end in a draw; rescale the labels right there
+        # instead of from a polling GUI timer (see _on_canvas_draw)
+        canvas.events.draw.connect(self._on_canvas_draw)
+        canvas.events.resize.connect(self._on_canvas_resize)
+
+    def _on_gl_reset(self) -> None:
+        """The GL context was reset (StageViewer signal, deferred).
+
+        On a true reparent the StageViewer replaced the entire canvas, so the
+        whole scene, plate node included, is rebuilt against the current
+        ``view.scene`` and the canvas-event connections are renewed. On a
+        plain hide/show the canvas survives; the old subtree is detached
+        first, so rebuilding on it is just a fresh start, not a duplicate.
         """
         if self._closing:
             return
-        self._plate_overlay.rebuild()
-        self._positions_overlay.rebuild()
-        self._recreate_stage_marker()
+        with suppress(Exception):
+            self._plate_node.parent = None  # drop the old subtree if any
+        self._build_scene()
+        self._connect_canvas_events()
         self._gl_suspended = False
         # repopulate the fresh visuals from the widget's source-of-truth state
         self._update_plate_transform()  # stage->plate node transform
         self._apply_palette()  # overlay colors + canvas background
         self._plate_overlay.set_plan(self._plan, calibrated=self._calibrated)
+        labels_on = self._toolbar.labels_action.isChecked()
+        self._plate_overlay.set_labels_visible(labels_on)
+        self._positions_overlay.set_labels_visible(labels_on)
+        self._positions_overlay.set_trail_visible(
+            self._toolbar.trails_action.isChecked()
+        )
         self._refresh_positions()
+        if self._marker_visible and self._last_stage_pos is not None:
+            x, y = self._last_stage_pos
+            matrix = self._affine_state.system_affine_translated(x, y)
+            self._stage_pos_marker.apply_transform(matrix.T)
+        self._last_px_per_um = None  # fresh visuals: labels need resizing
         self._update_label_font_sizes()
         self._stage_viewer.canvas.update()
 
@@ -444,7 +504,7 @@ class StageMapWidget(QWidget):
             self._auto_bind_attempted = True
             self.bindToFirstPositionTable()
         # resume background polling if the toggle is on (see hideEvent)
-        if self._timer_id is not None and not self._closing:
+        if self._polling and not self._closing:
             with suppress(Exception):
                 if not self._stage_poller.isRunning():
                     self._stage_poller.start()
@@ -474,7 +534,7 @@ class StageMapWidget(QWidget):
     @property
     def poll_stage_position(self) -> bool:
         """Whether the live stage position is being polled and displayed."""
-        return self._timer_id is not None
+        return self._polling
 
     @poll_stage_position.setter
     def poll_stage_position(self, value: bool) -> None:
@@ -553,6 +613,10 @@ class StageMapWidget(QWidget):
             y0, y1 = cy - min_h / 2, cy + min_h / 2
 
         self._stage_viewer.view.camera.set_range(x=(x0, x1), y=(y0, y1), margin=margin)
+        # remember the fitted rect: while the camera still matches it (the
+        # user has not zoomed/panned), a canvas resize re-fits automatically
+        r = self._stage_viewer.view.camera.rect
+        self._fit_rect = (r.left, r.bottom, r.width, r.height)
 
     def value(
         self, exclude_unchecked: bool = True, exclude_hidden_cols: bool = True
@@ -672,6 +736,7 @@ class StageMapWidget(QWidget):
     def _set_plan(self, plan: useq.WellPlatePlan | None, *, calibrated: bool) -> None:
         self._plan = plan
         self._calibrated = calibrated and plan is not None
+        self._last_px_per_um = None  # new plate: labels need resizing
         self._update_plate_transform()
         self._plate_overlay.set_plan(plan, calibrated=self._calibrated)
         self._update_status()
@@ -810,6 +875,12 @@ class StageMapWidget(QWidget):
         fg = palette.color(QPalette.ColorRole.WindowText)
         mid = palette.color(QPalette.ColorRole.Mid)
 
+        # selection must depart from POSITION_COLOR toward the background's
+        # opposite: brighter blue on a dark theme, darker on a light one
+        self._positions_overlay.set_selected_color(
+            SELECTED_COLOR_DARK_BG if bg.lightness() < 128 else SELECTED_COLOR_LIGHT_BG
+        )
+
         self._stage_viewer.canvas.bgcolor = _rgba(bg)
         self._map_frame.setStyleSheet(
             f"QFrame#stageMapFrame {{ border: 1px solid {mid.name()}; "
@@ -825,12 +896,20 @@ class StageMapWidget(QWidget):
         small for its id to be legible.  Position names are left at a fixed
         size: unlike the well ids they annotate something that can be far
         smaller than a pixel when zoomed out.
+
+        Runs on every canvas draw, so it must be a no-op at constant zoom:
+        vispy schedules a repaint on every visual touch (even a same-value
+        ``visible`` assignment), which would otherwise sustain a redraw loop.
         """
         canvas_width = self._stage_viewer.canvas.size[0]
         rect_width = self._stage_viewer.view.camera.rect.width
         if not canvas_width or not rect_width:  # pragma: no cover
             return
         px_per_um = canvas_width / rect_width
+        if px_per_um == self._last_px_per_um:
+            return
+        self._last_px_per_um = px_per_um
+        self._update_label_offsets()
 
         if self._plan is not None:
             well_px = self._plan.plate.well_size[0] * 1000 * px_per_um
@@ -860,22 +939,75 @@ class StageMapWidget(QWidget):
             else []
         )
         xy = [(pos.x or 0.0, pos.y or 0.0) for pos in positions]
-        # label with the name if there is one, else with the well it sits in
-        names = []
-        for pos in positions:
-            label = pos.name or ""
-            if not label and pos.plate_row is not None and pos.plate_col is not None:
-                label = well_id(pos.plate_row, pos.plate_col)
-            names.append(label)
+        # name above the marker, inferred well id below it
+        names = [pos.name or "" for pos in positions]
+        wells = [
+            well_id(pos.plate_row, pos.plate_col)
+            if pos.plate_row is not None and pos.plate_col is not None
+            else ""
+            for pos in positions
+        ]
         self._last_fov_size = self._fov_size()
-        self._positions_overlay.set_positions(xy, names, self._last_fov_size)
+        self._pos_xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+        self._positions_overlay.set_positions(xy, names, wells, self._last_fov_size)
+        self._update_label_offsets()
+        self._sync_selection_from_table()
+
+    def _update_label_offsets(self) -> None:
+        """Keep the labels a constant screen distance from their marker.
+
+        The clearance is a scene-space vector (labels live in stage µm), so
+        zoom and plate-transform changes both require a recompute.
+        """
+        ov = self._positions_overlay
+        if self._pos_xy is None or not len(self._pos_xy):
+            return
+        try:
+            tr = ov.label_to_canvas_transform()
+            origin = tr.map((0.0, 0.0))[:2]
+            # the scene point 24 px above the scene origin on screen. vispy
+            # Text anchors align to the glyph bbox ascender, which absorbs
+            # ~10 px, so the visible gap is roughly offset - 10 px - marker
+            # radius: 24 px leaves the text almost touching the dot
+            up = tr.imap((origin[0], origin[1] - 24.0))[:2]
+        except Exception:
+            return  # transforms not ready yet (first draw pending)
+        ov.set_label_offset(np.asarray(up, dtype=float))
+
+    def _sync_selection_from_table(self) -> None:
+        """Mirror the bound table's selected rows as highlighted markers."""
+        if self._pos_table is None:
+            self._positions_overlay.set_selected(())
+            return
+        rows = {i.row() for i in self._pos_table.table().selectedIndexes()}
+        self._positions_overlay.set_selected(rows)
+
+    def _position_at(self, canvas_pos: Sequence[float]) -> int | None:
+        """Return the index of the position under `canvas_pos`, or None."""
+        if self._pos_xy is None or not len(self._pos_xy):
+            return None
+        canvas_width = self._stage_viewer.canvas.size[0]
+        rect_width = self._stage_viewer.view.camera.rect.width
+        if not canvas_width or not rect_width:  # pragma: no cover
+            return None
+        # click position in plate space, positions mapped stage -> plate
+        plate_click = self._stage_viewer.view.camera.transform.imap(canvas_pos)[:2]
+        plate_pts = self._plate_node.transform.map(self._pos_xy)[:, :2]
+        d2 = np.sum((plate_pts - plate_click) ** 2, axis=1)
+        idx = int(np.argmin(d2))
+        # hit radius: a comfortable ~14 px around the marker, in µm
+        radius_um = 14 * rect_width / canvas_width
+        return idx if d2[idx] <= radius_um**2 else None
 
     def _update_fov_size(self) -> None:
         """Resize everything that depends on the camera field of view.
 
-        Called both from core events and from the poll timer, since not every
-        way of changing the field of view (binning, swapping camera device, a
-        python camera changing its own ROI) emits an event.
+        Called from core events (pixelSizeChanged, roiSet, binning /
+        camera-device propertyChanged, systemConfigurationLoaded) and from the
+        background poller's fovChanged, which backstops changes that emit no
+        event (clearROI, a python camera resizing its own ROI). Never call
+        this from a GUI-thread timer: core accessors can block on a device
+        module lock held by the poller during a slow serial read.
         """
         if (fov := self._fov_size()) is None or fov == self._last_fov_size:
             return
@@ -936,19 +1068,59 @@ class StageMapWidget(QWidget):
         self._refresh_positions()
         self.positionTableChanged.emit(None)
 
+    def _on_trails_toggled(self, checked: bool) -> None:
+        self._positions_overlay.set_trail_visible(checked)
+
     def _on_labels_toggled(self, checked: bool) -> None:
         self._plate_overlay.set_labels_visible(checked)
         self._positions_overlay.set_labels_visible(checked)
+        self._last_px_per_um = None  # re-evaluate label size + visibility
 
     # STAGE -------------------------------------------------------------------
 
     def _update_stage_controller(self) -> None:
-        if xy_device := self._mmc.getXYStageDevice():
+        # cache the label so event handlers never ask the core for it
+        self._xy_device = xy_device = self._mmc.getXYStageDevice()
+        if xy_device:
             self._stage_controller = QStageMoveAccumulator.for_device(
                 xy_device, self._mmc
             )
         else:
             self._stage_controller = None
+            self._stage_pos_label.setText("No XY stage device")
+
+    def _on_mouse_release(self, event: MouseEvent) -> None:
+        """Single left click on a position selects it in the bound table.
+
+        A drag (pan) is not a click: the release must land within a few px of
+        the press. Ctrl-click toggles, so several positions can be gathered;
+        clicking empty map clears the selection. The selection highlight comes
+        back via the table's itemSelectionChanged -> _sync_selection_from_table.
+        """
+        if self._pos_table is None or event.button != 1:
+            return
+        press = getattr(event, "press_event", None)
+        if press is None:
+            return
+        dx, dy = event.pos[0] - press.pos[0], event.pos[1] - press.pos[1]
+        if dx * dx + dy * dy > 25:  # moved > 5 px: a pan, not a click
+            return
+        tbl = self._pos_table.table()
+        idx = self._position_at(event.pos)
+        if idx is None:
+            tbl.clearSelection()
+            return
+        ctrl = any(
+            getattr(k, "name", "") == "Control" for k in (event.modifiers or ())
+        )
+        flags = QItemSelectionModel.SelectionFlag.Rows | (
+            QItemSelectionModel.SelectionFlag.Toggle
+            if ctrl
+            else QItemSelectionModel.SelectionFlag.ClearAndSelect
+        )
+        model_index = tbl.model().index(idx, 0)
+        tbl.selectionModel().select(model_index, flags)
+        tbl.scrollTo(model_index)
 
     def _on_mouse_double_click(self, event: MouseEvent) -> None:
         """Move the stage to the double-clicked position."""
@@ -962,18 +1134,22 @@ class StageMapWidget(QWidget):
         self._stage_pos_label.setText(f"X: {x:.2f} µm  Y: {y:.2f} µm")
 
     def _on_poll_stage_toggled(self, checked: bool) -> None:
+        self._polling = checked
         self._marker_visible = checked
         self._stage_pos_marker.visible = checked
         if checked:
             self._stage_poller.start()  # background position reads (off GUI thread)
-            if self._timer_id is None:
-                # GUI timer: cheap, zoom-dependent redraws only (no hardware read)
-                self._timer_id = self.startTimer(self._poll_interval_ms)
         else:
             self._stage_poller.stop()
-            if self._timer_id is not None:
-                self.killTimer(self._timer_id)
-                self._timer_id = None
+
+    def _on_xy_event(self, device: str, stage_x: float, stage_y: float) -> None:
+        """Apply a position reported by the core callback (commanded moves).
+
+        Instant and free; the poller covers only what the adapter never
+        reports (joystick moves on serial stages).
+        """
+        if device == getattr(self, "_xy_device", ""):
+            self._on_stage_position_polled(stage_x, stage_y)
 
     def _on_stage_position_polled(self, stage_x: float, stage_y: float) -> None:
         """Update the marker + label from a background-polled stage position.
@@ -998,21 +1174,45 @@ class StageMapWidget(QWidget):
         matrix = self._affine_state.system_affine_translated(stage_x, stage_y)
         self._stage_pos_marker.apply_transform(matrix.T)
 
-    def timerEvent(self, event: QTimerEvent | None) -> None:
-        """Cheap, zoom-dependent redraws only (FOV rect + label font sizes).
+    def _on_canvas_draw(self, event: object = None) -> None:
+        """Rescale label fonts whenever the map redraws (zoom/pan/resize).
 
-        The stage position is read off the GUI thread by ``_stage_poller`` and
-        applied in ``_on_stage_position_polled``, so map drawing/zoom/pan is
-        never blocked by a (slow, serial) stage read.
+        Never make core calls here: even cheap accessors like
+        ``getPixelSizeUm`` can block on a device module lock that the poller
+        thread holds during a slow serial read. Field-of-view changes arrive
+        via core events (``pixelSizeChanged``, ``roiSet``,
+        ``propertyChanged``, ``systemConfigurationLoaded``) and the poller
+        thread's ``fovChanged``.
+
+        A font change schedules one follow-up draw; the px_per_um cache in
+        ``_update_label_font_sizes`` makes that pass a no-op, so this cannot
+        self-sustain a redraw loop.
         """
         if self._gl_suspended or self._closing:  # reparent / teardown in flight
             return
-        if not self._mmc.getXYStageDevice():
-            self._stage_pos_label.setText("No XY stage device")
-            return
-        # cheap in-memory reads; catch field-of-view / zoom changes (no event)
-        self._update_fov_size()
         self._update_label_font_sizes()
+        # Recompute the label clearance on every draw: it is pure math, a
+        # no-op when unchanged, and a draw is the only moment the transform
+        # chain is guaranteed live (outside one, e.g. right after a GL reset,
+        # the computation can silently fail).
+        self._update_label_offsets()
+
+    def _on_canvas_resize(self, event: object = None) -> None:
+        """Keep the map fitted to the canvas while the view is untouched.
+
+        The camera keeps its world rect across a canvas resize, so growing the
+        widget just adds empty margin. As long as the camera still shows
+        exactly the last ``zoom_to_fit`` rect (the user has not zoomed or
+        panned since), re-fit to the new canvas. A hand-adjusted view is never
+        overridden.
+        """
+        if self._gl_suspended or self._closing or self._fit_rect is None:
+            return
+        r = self._stage_viewer.view.camera.rect
+        cur = (r.left, r.bottom, r.width, r.height)
+        scale = max(abs(v) for v in self._fit_rect) or 1.0
+        if all(abs(c - f) <= scale * 1e-6 for c, f in zip(cur, self._fit_rect)):
+            self.zoom_to_fit()
 
     def _build_stage_marker(self) -> None:
         """Create the stage-position marker on the scene (fresh GL program)."""
@@ -1022,26 +1222,10 @@ class StageMapWidget(QWidget):
             parent=self._plate_node,
             rect_width=w,
             rect_height=h,
-            marker_symbol_size=min(w, h) / 10,
+            # screen px: the crosshair keeps a constant size at any zoom
+            marker_symbol_size=16,
         )
         self._stage_pos_marker.visible = self._marker_visible
-
-    def _recreate_stage_marker(self) -> None:
-        """Drop the old marker and build a fresh one after a GL-context reset.
-
-        vispy's Markers visual does not survive the QOpenGLWidget context
-        recreation on reparent. Detaching the old visual and constructing a new
-        one compiles a fresh GL program on the current context.
-        """
-        old = self._stage_pos_marker
-        old.visible = False
-        with suppress(Exception):
-            old.parent = None  # remove the broken visual from the scene
-        self._build_stage_marker()
-        if self._marker_visible and self._last_stage_pos is not None:
-            x, y = self._last_stage_pos
-            matrix = self._affine_state.system_affine_translated(x, y)
-            self._stage_pos_marker.apply_transform(matrix.T)
 
     # CORE EVENTS -------------------------------------------------------------
 
@@ -1062,7 +1246,7 @@ class StageMapWidget(QWidget):
         uses: ``local = R(-rotation) @ (stage - a1_center)`` (columns -> +x, rows
         -> -y), so A1 is always top-left regardless of how the stage axes are
         wired. The marker (drawn at the raw stage position) is mapped by the same
-        transform, so it shows the TRUE position on the fixed plate -- if the
+        transform, so it shows the TRUE position on the fixed plate: if the
         calibration/axes are wrong the marker is visibly off, rather than the
         plate silently rotating. Identity when there is no plan (plain stage
         space), which is also what an uncalibrated preview (a1=0, rot=0) yields.
@@ -1078,12 +1262,41 @@ class StageMapWidget(QWidget):
         # vispy MatrixTransform uses row-vector convention (out = in @ M), so
         # pass the transpose of our column-convention matrix (as apply_transform).
         self._plate_node.transform = MatrixTransform(matrix=m.T)
+        # the label clearance vector lives in stage µm and depends on this
+        # transform's direction (a rotated/reflected calibration flips it);
+        # the zoom cache alone would not notice the change
+        self._update_label_offsets()
 
     def _on_pixel_size_changed(self, value: float = 0.0) -> None:
         self._affine_state.refresh()
         self._update_fov_size()
 
     def _on_roi_changed(self) -> None:
+        self._update_fov_size()
+
+    def _on_property_changed(self, device: str, prop: str, value: str = "") -> None:
+        """Catch field-of-view changes that emit no dedicated event.
+
+        Binning changes only emit propertyChanged, and swapping the Core
+        camera / XY stage device likewise.
+        """
+        if device == "Core":
+            if prop == "Camera":
+                self._update_fov_size()
+            elif prop == "XYStage":
+                self._update_stage_controller()
+        elif prop == "Binning":
+            self._update_fov_size()
+
+    def _on_fov_polled(self, px_size: float, width: int, height: int) -> None:
+        """Apply a field-of-view change spotted by the background poller.
+
+        The poller only emits when the FOV actually differs, so this runs
+        rarely; it backstops changes with no core event at all (``clearROI``,
+        a python camera resizing its own ROI).
+        """
+        if self._closing:
+            return
         self._update_fov_size()
 
     def _disconnect(self) -> None:
@@ -1100,15 +1313,13 @@ class StageMapWidget(QWidget):
         # widget; a QThread still running at destruction aborts the process.
         with suppress(Exception):
             self._stage_poller.stop()
-        if self._timer_id is not None:
-            with suppress(Exception):
-                self.killTimer(self._timer_id)
-            self._timer_id = None
         events = self._mmc.events
         for sig, slot in (
             (events.systemConfigurationLoaded, self._on_sys_config_loaded),
             (events.pixelSizeChanged, self._on_pixel_size_changed),
             (events.roiSet, self._on_roi_changed),
+            (events.propertyChanged, self._on_property_changed),
+            (events.XYStagePositionChanged, self._on_xy_event),
         ):
             with suppress(Exception):
                 sig.disconnect(slot)

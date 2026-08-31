@@ -36,6 +36,9 @@ class StagePositionMarker(Compound):
             color=Color("transparent"),
         )
 
+        # scaling="fixed": the symbol is a screen annotation ("you are here")
+        # and keeps a constant pixel size at any zoom; only the FOV rectangle
+        # is scene-scaled, since it represents a physical extent
         self._marker = Markers(
             pos=np.array([center]),
             symbol=marker_symbol,
@@ -43,10 +46,15 @@ class StagePositionMarker(Compound):
             edge_color=Color(marker_symbol_color),
             size=marker_symbol_size,
             edge_width=marker_symbol_edge_width,
-            scaling="scene",
+            scaling="fixed",
         )
 
         super().__init__([self._marker, self._rect])
+
+        # draw above everything else (position dots/labels use orders up to
+        # 50, see _stage_map/_overlays.py): the live stage position must never
+        # hide behind other annotations
+        self.order = 60
 
         self.parent = parent
         self._rect.visible = show_rect

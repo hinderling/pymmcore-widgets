@@ -9,6 +9,7 @@ import vispy
 import vispy.scene
 import vispy.visuals
 from qtpy.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from qtpy.QtGui import QPalette
 from qtpy.QtWidgets import QLabel, QVBoxLayout, QWidget
 from vispy import scene
 from vispy.scene.visuals import Image
@@ -28,11 +29,16 @@ class StageViewer(QWidget):
 
     # Emitted around a Qt reparent (e.g. floating/redocking a dock widget that
     # contains this viewer) that recreates the underlying QOpenGLWidget's GL
-    # context. vispy has no context-loss recovery: afterward the old visuals are
-    # bound to invalid GL objects. On ``glContextAboutToReset`` owners should
-    # hide/stop drawing their visuals; on ``glContextReset`` they should rebuild
-    # them (construct fresh visuals so new GL objects are created on the live
-    # context). This viewer rebuilds its own grid lines; owners rebuild theirs.
+    # context. vispy has no context-loss recovery: afterward the old visuals
+    # are bound to invalid GL objects, and flushing their stale commands
+    # (draws OR deletes) into the window's SHARED GL namespace can corrupt
+    # every other canvas in the application (e.g. the napari viewer). On a
+    # true reparent this viewer therefore replaces the ENTIRE canvas: the old
+    # one is parked unpainted forever and `self.canvas`/`self.view` point to a
+    # fresh one. On ``glContextAboutToReset`` owners must hide/stop drawing
+    # their visuals; on ``glContextReset`` they must rebuild their whole scene
+    # against the (possibly new) ``self.view.scene`` and re-connect anything
+    # they had connected to ``self.canvas.events``.
     glContextAboutToReset = Signal()
     glContextReset = Signal()
 
@@ -43,35 +49,46 @@ class StageViewer(QWidget):
 
         self._clims: tuple[float, float] | None = None
         self._cmap: cmap.Colormap = cmap.Colormap("gray")
-
-        self.canvas = vispy.scene.SceneCanvas(show=True)
-
-        self.view = cast("ViewBox", self.canvas.central_widget.add_view())
-        self.view.camera = scene.PanZoomCamera(aspect=1)
-
         self._grid_visible = False
-        self._create_grid()
+
+        # reparent bookkeeping (see eventFilter / _on_context_destroyed)
+        self._gl_reset_pending = False
+        self._needs_canvas_recreate = False
+        self._gl_context = None  # QOpenGLContext tracked at each paint
+        # canvases replaced after a reparent. Kept referenced and unpainted:
+        # if one were garbage collected, vispy would queue GL DELETEs for
+        # handles of a destroyed context, and a later flush could run them in
+        # the shared namespace where the ids now belong to live objects.
+        self._dead_canvases: list[vispy.scene.SceneCanvas] = []
+
+        self._create_canvas()
 
         main_layout = QVBoxLayout(self)
         main_layout.setSpacing(0)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.addWidget(self.canvas.native)
 
-        # Watch the native GL widget for the reparent that recreates its GL
-        # context (napari does not forward hide/show to a floated dock's
-        # content, so we watch the canvas widget itself, not this QWidget).
-        self._gl_reset_pending = False
-        self.canvas.native.installEventFilter(self)
-
         self._show_hover_label = True
         self._hover_pos_label = QLabel(self)
-        self._hover_pos_label.setStyleSheet("color: rgba(100, 255, 255, 100); ")
+        self._style_hover_label()
         self._hover_pos_label.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
         )
-        self.canvas.events.mouse_move.connect(self._on_mouse_move)
 
     # --------------------GL CONTEXT RESET (reparent)--------------------
+
+    def _create_canvas(self) -> None:
+        """Create the vispy canvas, view, camera and grid (fresh GL context)."""
+        self.canvas = vispy.scene.SceneCanvas(show=True)
+        self.view = cast("ViewBox", self.canvas.central_widget.add_view())
+        self.view.camera = scene.PanZoomCamera(aspect=1)
+        self._create_grid()
+        # Watch the native GL widget: hide/show around reparents (napari does
+        # not forward hide/show to a floated dock's content, so we watch the
+        # canvas widget itself, not this QWidget) and paints to track the live
+        # QOpenGLContext (see eventFilter).
+        self.canvas.native.installEventFilter(self)
+        self.canvas.events.mouse_move.connect(self._on_mouse_move)
 
     def _create_grid(self) -> None:
         self._grid_lines = vispy.scene.GridLines(
@@ -85,16 +102,56 @@ class StageViewer(QWidget):
             et = event.type()
             if et == QEvent.Type.Hide:
                 self._suspend_gl()
-            elif et in (QEvent.Type.Show, QEvent.Type.WinIdChange):
+            elif et == QEvent.Type.Show:
                 # Hide visuals NOW (synchronously, before the imminent paintGL
-                # draws them against dead handles), even if no Hide was seen.
+                # draws them against possibly dead handles) and rebuild them.
                 self._suspend_gl()
-                if not self._gl_reset_pending:
-                    # Rebuild deferred: the new context is created lazily on the
-                    # next paintGL, so fresh CREATE commands must wait for it.
-                    self._gl_reset_pending = True
-                    QTimer.singleShot(0, self._do_gl_reset)
+                self._schedule_reset()
+            elif et == QEvent.Type.Paint:
+                # Track the context vispy is flushing into. Its
+                # aboutToBeDestroyed signal is the ground truth for context
+                # loss: the Qt events delivered around a dock reparent vary
+                # with native-realization timing (WinIdChange may never come),
+                # but the context always announces its own destruction.
+                self._track_context(getattr(obj, "context", lambda: None)())
         return super().eventFilter(obj, event)
+
+    def _track_context(self, ctx: QObject | None) -> None:
+        if ctx is None or ctx is self._gl_context:
+            return
+        self._untrack_context()
+        self._gl_context = ctx
+        ctx.aboutToBeDestroyed.connect(self._on_context_destroyed)
+
+    def _untrack_context(self) -> None:
+        if self._gl_context is not None:
+            with suppress(Exception):
+                self._gl_context.aboutToBeDestroyed.disconnect(
+                    self._on_context_destroyed
+                )
+            self._gl_context = None
+
+    def _on_context_destroyed(self) -> None:
+        """The native's GL context is being destroyed (e.g. a dock reparent).
+
+        Everything vispy uploaded is gone; this canvas can never be drawn
+        again (a later paint would flush stale commands into a lazily created
+        context in the shared namespace). Stop its paints immediately and
+        replace it.
+        """
+        self._untrack_context()
+        with suppress(Exception):
+            self.canvas.native.setUpdatesEnabled(False)
+        self._needs_canvas_recreate = True
+        self._suspend_gl()
+        self._schedule_reset()
+
+    def _schedule_reset(self) -> None:
+        if not self._gl_reset_pending:
+            # Deferred: the new context is created lazily on the next paintGL,
+            # so fresh CREATE commands must wait for it.
+            self._gl_reset_pending = True
+            QTimer.singleShot(0, self._do_gl_reset)
 
     def _suspend_gl(self) -> None:
         with suppress(Exception):
@@ -103,12 +160,50 @@ class StageViewer(QWidget):
 
     def _do_gl_reset(self) -> None:
         self._gl_reset_pending = False
-        # rebuild our own grid (fresh gloo objects on the new context)...
-        with suppress(Exception):
-            self._grid_lines.parent = None
-        self._create_grid()
-        # ...then let owners rebuild their overlays/markers.
+        try:
+            if self._needs_canvas_recreate:
+                self._needs_canvas_recreate = False
+                self._recreate_canvas()
+            else:
+                # same context (plain hide/show): fresh grid on the live canvas
+                with suppress(Exception):
+                    self._grid_lines.parent = None
+                self._create_grid()
+        except RuntimeError:
+            # the widget is being torn down (context destruction at shutdown
+            # also schedules a reset); nothing left to rebuild
+            return
+        # let owners rebuild their overlays/markers on self.view.scene
         self.glContextReset.emit()
+
+    def _recreate_canvas(self) -> None:
+        """Replace the whole canvas after a reparent destroyed its GL context.
+
+        The old canvas is unsalvageable and even deleting it is unsafe (its
+        teardown would flush stale GL handles into the shared namespace), so
+        it is parked: hidden, updates disabled, never painted again, and kept
+        referenced in ``_dead_canvases``. Any image visuals owned by the old
+        scene are gone; owners repopulate via the ``glContextReset`` signal.
+        """
+        old = self.canvas
+        self._untrack_context()  # no-op if the destroy signal already did
+        with suppress(Exception):
+            old.native.removeEventFilter(self)
+        with suppress(Exception):
+            old.events.mouse_move.disconnect(self._on_mouse_move)
+        old.native.setUpdatesEnabled(False)
+        old.native.hide()
+        if (layout := self.layout()) is not None:
+            layout.removeWidget(old.native)
+        old.native.setParent(None)
+        self._dead_canvases.append(old)
+
+        rect = self.view.camera.rect
+        self._create_canvas()
+        if (layout := self.layout()) is not None:
+            layout.addWidget(self.canvas.native)
+        self.canvas.native.show()
+        self.view.camera.rect = rect  # keep the zoom/pan across the swap
 
     # --------------------PUBLIC METHODS--------------------
 
@@ -223,6 +318,26 @@ class StageViewer(QWidget):
             y += 48
         self._hover_pos_label.move(x, y)
         self._hover_pos_label.setVisible(True)
+
+    def _style_hover_label(self) -> None:
+        """Color the hover position readout from the palette.
+
+        The theme's own foreground color stays readable on light and dark
+        themes alike.
+        """
+        fg = self.palette().color(QPalette.ColorRole.WindowText)
+        self._hover_pos_label.setStyleSheet(
+            f"color: rgba({fg.red()}, {fg.green()}, {fg.blue()}, 200);"
+        )
+
+    def changeEvent(self, event: QEvent | None) -> None:
+        """Follow the application theme when it changes."""
+        super().changeEvent(event)
+        if event is not None and event.type() in (
+            QEvent.Type.PaletteChange,
+            QEvent.Type.StyleChange,
+        ):
+            self._style_hover_label()
 
     def leaveEvent(self, a0: QMouseEvent | None) -> None:
         self._hover_pos_label.setVisible(False)  # pragma: no cover

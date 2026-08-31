@@ -6,12 +6,12 @@ inversion, unlike the Qt-graphics based WellPlateView).
 
 from __future__ import annotations
 
-from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
 from vispy import scene
+from vispy.color import Color
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -43,8 +43,13 @@ BLEND_STATE = {
 CALIBRATED_COLOR = "#999999"
 UNCALIBRATED_COLOR = "#E6A23C"
 POSITION_COLOR = "#00A3FF"
-FIRST_POSITION_COLOR = "#FFFFFF"
+# selection stands out from POSITION_COLOR toward the background's opposite:
+# brighter on a dark theme, darker on a light one (see set_selected_color)
+SELECTED_COLOR_DARK_BG = "#8FE3FF"
+SELECTED_COLOR_LIGHT_BG = "#005F99"
 TRAIL_COLOR = (0.0, 0.64, 1.0, 0.6)  # POSITION_COLOR with alpha
+MARKER_SIZE = 9
+MARKER_SIZE_SELECTED = 13
 
 
 def _rotation_matrix(rotation: float | None) -> np.ndarray:
@@ -135,20 +140,6 @@ class WellPlateOverlay:
             vis.set_gl_state(**BLEND_STATE)
             vis.visible = False
 
-    def rebuild(self) -> None:
-        """Recreate the vispy visuals with fresh gloo objects.
-
-        A GL-context reset (Qt reparent -- e.g. a dock float) leaves the old
-        visuals bound to dead GL handles; vispy has no re-upload path, so the
-        only recovery is to drop them and build new ones. The caller must
-        re-populate afterward (set_plan / set_colors / set_labels_visible).
-        """
-        for vis in (self._outlines, self._border, self._labels):
-            with suppress(Exception):
-                vis.parent = None
-        self._create_visuals()
-        self._has_labels = False
-
     def hide(self) -> None:
         """Hide every sub-visual without touching cached state (GL suspend)."""
         for vis in (self._outlines, self._border, self._labels):
@@ -164,7 +155,11 @@ class WellPlateOverlay:
     def set_labels_visible(self, visible: bool) -> None:
         """Show/hide the well name labels."""
         self._show_labels = visible
-        self._labels.visible = visible and self._has_labels
+        # only touch the visual on change: vispy schedules a canvas repaint
+        # on every assignment, even a same-value one
+        target = visible and self._has_labels
+        if self._labels.visible != target:
+            self._labels.visible = target
 
     def set_colors(self, outline: ColorLike, label: ColorLike) -> None:
         """Set the colors used for a calibrated plate (uncalibrated stays amber)."""
@@ -284,6 +279,12 @@ class PositionsOverlay:
         self._show_trail = True
         self._show_labels = True
         self._n_positions = 0
+        self._pts = np.zeros((0, 2))
+        self._selected: set[int] = set()
+        self._selected_color = SELECTED_COLOR_DARK_BG
+        # scene-space vector that shifts the name label up (and the well label
+        # down) clear of the marker; owner recomputes it from the zoom
+        self._label_offset = np.zeros(2)
         self._create_visuals()
 
     def _create_visuals(self) -> None:
@@ -305,33 +306,34 @@ class PositionsOverlay:
             parent=self._parent, scaling="fixed", pos=np.zeros((1, 2)), size=0
         )
         self._markers.order = ORDER_MARKERS
+        # position name above the marker, inferred well id below it; the
+        # owner keeps both clear of the marker via set_label_offset
         self._labels = scene.visuals.Text(
             parent=self._parent,
             font_size=9,
             anchor_x="center",
-            anchor_y="top",
+            anchor_y="bottom",
             face=self._face,
         )
         self._labels.order = ORDER_LABELS
-        for vis in (self._fovs, self._trail, self._markers, self._labels):
+        self._well_labels = scene.visuals.Text(
+            parent=self._parent,
+            font_size=8,
+            anchor_x="center",
+            anchor_y="top",
+            face=self._face,
+        )
+        self._well_labels.order = ORDER_LABELS
+        for vis in self._all_visuals():
             vis.set_gl_state(**BLEND_STATE)
             vis.visible = False
 
-    def rebuild(self) -> None:
-        """Recreate the vispy visuals with fresh gloo objects (post GL reset).
-
-        See WellPlateOverlay.rebuild. The caller must re-populate afterward via
-        set_positions / set_trail_visible / set_labels_visible.
-        """
-        for vis in (self._fovs, self._trail, self._markers, self._labels):
-            with suppress(Exception):
-                vis.parent = None
-        self._create_visuals()
-        self._n_positions = 0
+    def _all_visuals(self) -> tuple:
+        return (self._fovs, self._trail, self._markers, self._labels, self._well_labels)
 
     def hide(self) -> None:
         """Hide every sub-visual without touching cached state (GL suspend)."""
-        for vis in (self._fovs, self._trail, self._markers, self._labels):
+        for vis in self._all_visuals():
             vis.visible = False
 
     # ----------------------------- public API -----------------------------
@@ -347,14 +349,72 @@ class PositionsOverlay:
         self._trail.visible = visible and self._n_positions > 1
 
     def set_labels_visible(self, visible: bool) -> None:
-        """Show/hide the position name labels."""
+        """Show/hide the position name and well labels."""
         self._show_labels = visible
-        self._labels.visible = visible and self._n_positions > 0
+        # only touch the visual on change (same-value assignments repaint)
+        target = visible and self._n_positions > 0
+        for vis in (self._labels, self._well_labels):
+            if vis.visible != target:
+                vis.visible = target
+
+    def set_selected(self, indices: Sequence[int] | set[int]) -> None:
+        """Highlight the positions at `indices` (selection in the bound table)."""
+        selected = {i for i in indices if 0 <= i < self._n_positions}
+        if selected == self._selected:
+            return
+        self._selected = selected
+        if self._n_positions:
+            self._apply_selection_style()
+
+    def set_selected_color(self, color: str) -> None:
+        """Set the highlight color (theme-dependent, chosen by the owner)."""
+        if color == self._selected_color:
+            return
+        self._selected_color = color
+        if self._n_positions and self._selected:
+            self._apply_selection_style()
+
+    def set_label_offset(self, offset: np.ndarray) -> None:
+        """Shift name labels by `offset` (scene µm) and well labels by its negative.
+
+        The owner computes the vector as N screen px of upward clearance at
+        the current zoom, so the labels stay clear of the marker.
+        """
+        offset = np.asarray(offset, dtype=float).reshape(2)
+        if np.allclose(offset, self._label_offset):
+            return
+        self._label_offset = offset
+        if self._n_positions:
+            self._labels.pos = self._pts + offset
+            self._well_labels.pos = self._pts - offset
+
+    def _apply_selection_style(self) -> None:
+        """Color markers, labels and FOV outlines; selection stands out."""
+        n = self._n_positions
+        colors = np.tile(Color(POSITION_COLOR).rgba, (n, 1))
+        size = np.full(n, MARKER_SIZE)
+        if self._selected:
+            sel = sorted(self._selected)
+            colors[sel] = Color(self._selected_color).rgba
+            size[sel] = MARKER_SIZE_SELECTED
+        self._markers.set_data(
+            pos=self._pts,
+            size=size,
+            face_color=colors,
+            edge_color=colors,
+            edge_width=1.5,
+        )
+        self._labels.color = colors
+        self._well_labels.color = colors
+        if self._fovs.visible:
+            # one color per rect vertex (5 per position)
+            self._fovs.set_data(color=np.repeat(colors, 5, axis=0))
 
     def set_positions(
         self,
         xy: Sequence[tuple[float, float]] | np.ndarray,
         names: Sequence[str],
+        wells: Sequence[str],
         fov_size: tuple[float, float] | None,
     ) -> None:
         """Draw `xy` stage positions (µm), in travel order.
@@ -364,28 +424,24 @@ class PositionsOverlay:
         xy : sequence of (x, y)
             Stage coordinates of the positions, in µm.
         names : sequence of str
-            One label per position (may be empty strings).
+            Position name per position, drawn above the marker (may be empty).
+        wells : sequence of str
+            Inferred well id per position, drawn below the marker (may be
+            empty).
         fov_size : (width, height) | None
             Camera field of view in µm, drawn as a rectangle around each
             position. If None, no FOV rectangles are drawn.
         """
         pts = np.asarray(xy, dtype=float).reshape(-1, 2)
+        self._pts = pts
         self._n_positions = n = len(pts)
+        self._selected = {i for i in self._selected if i < n}
         if not n:
             self._markers.set_data(pos=np.zeros((1, 2)), size=0)
-            for vis in (self._fovs, self._trail, self._markers, self._labels):
+            for vis in self._all_visuals():
                 vis.visible = False
             return
 
-        # markers: first position highlighted (start of the travel path)
-        edge_color = [FIRST_POSITION_COLOR] + [POSITION_COLOR] * (n - 1)
-        self._markers.set_data(
-            pos=pts,
-            size=9,
-            face_color=POSITION_COLOR,
-            edge_color=edge_color,
-            edge_width=1.5,
-        )
         self._markers.visible = True
 
         # travel path with direction arrows at each segment end
@@ -414,8 +470,19 @@ class PositionsOverlay:
         else:
             self._fovs.visible = False
 
-        # labels slightly below each marker (well ids sit at the well centers)
-        self._labels.text = [str(x) for x in names] or [""] * n
-        self._labels.pos = pts
-        self._labels.color = POSITION_COLOR
+        # name above the marker, well id below, both offset clear of it.
+        # vispy Text anchors align to the drawn-glyph bounding box, so the
+        # clearance comes from offsetting the anchor positions themselves
+        self._labels.text = [str(x) for x in names]
+        self._labels.pos = pts + self._label_offset
         self._labels.visible = self._show_labels
+        self._well_labels.text = [str(w) for w in wells]
+        self._well_labels.pos = pts - self._label_offset
+        self._well_labels.visible = self._show_labels
+
+        # colors (and marker sizes) come from the selection styling
+        self._apply_selection_style()
+
+    def label_to_canvas_transform(self):
+        """Transform from label coordinates (stage µm) to canvas px."""
+        return self._labels.get_transform("visual", "canvas")
