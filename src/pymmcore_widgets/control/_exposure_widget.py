@@ -3,7 +3,7 @@ from __future__ import annotations
 from pymmcore_plus import CMMCorePlus, Keyword
 from qtpy.QtCore import Qt, Slot
 from qtpy.QtWidgets import QApplication, QDoubleSpinBox, QHBoxLayout, QLabel, QWidget
-from superqt.utils import signals_blocked
+from superqt.utils import ensure_main_thread, signals_blocked
 
 
 class ExposureWidget(QWidget):
@@ -80,8 +80,16 @@ class ExposureWidget(QWidget):
         if orig_cam != self._camera:
             self._on_load()
 
+    @ensure_main_thread  # type: ignore [misc]
     @Slot()
     def _on_load(self) -> None:
+        # Marshalled to the main thread: with the psygnal signal backend, core
+        # events are delivered on the emitting (e.g. acquisition) thread, and
+        # mutating the spinbox there is undefined behavior. In particular the
+        # signals_blocked guard is released before Qt processes a cross-thread
+        # setValue, so the spinbox can later emit valueChanged (which is wired
+        # to mmc.setExposure) with a stale value, overriding the exposure of a
+        # frame in a running acquisition.
         with signals_blocked(self.spinBox):
             if self._camera and self._camera in self._mmc.getLoadedDevices():
                 self.setEnabled(True)
@@ -89,8 +97,10 @@ class ExposureWidget(QWidget):
             else:
                 self.setEnabled(False)
 
+    @ensure_main_thread  # type: ignore [misc]
     @Slot(str, float)
     def _on_exp_changed(self, camera: str, exposure: float) -> None:
+        # marshalled to the main thread; see _on_load
         if camera == self._camera:
             with signals_blocked(self.spinBox):
                 self.spinBox.setValue(exposure)
