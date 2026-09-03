@@ -43,14 +43,7 @@ def test_exposure_widget(qtbot: QtBot, global_mmcore: CMMCorePlus):
 
 
 def test_exposure_widget_cross_thread_update(qtbot: QtBot, global_mmcore: CMMCorePlus):
-    """Core events delivered on a worker thread must not echo setExposure.
-
-    With the psygnal backend, core events run handlers on the emitting (e.g.
-    acquisition) thread. The spinbox update must be marshalled to the main
-    thread inside the signals_blocked guard; otherwise the spinbox can emit
-    valueChanged (wired to mmc.setExposure) with a stale value and override
-    the exposure of a frame in a running acquisition.
-    """
+    """A core event handled on a worker thread must not write back to the core."""
     import threading
 
     global_mmcore.setExposure(20)
@@ -68,9 +61,7 @@ def test_exposure_widget_cross_thread_update(qtbot: QtBot, global_mmcore: CMMCor
     t.start()
     t.join()
 
-    # the update must be QUEUED to the main thread, not applied on the
-    # worker: a synchronous cross-thread setValue is undefined behavior and
-    # escapes the signals_blocked guard
+    # the update is queued to the main thread, not applied on the worker
     assert wdg.spinBox.value() == 20
     qtbot.waitUntil(lambda: wdg.spinBox.value() == 33.0)
     assert echoes == []
