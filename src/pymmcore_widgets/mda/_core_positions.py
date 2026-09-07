@@ -430,10 +430,19 @@ class CoreConnectedPositionTable(PositionTable):
                     try:
                         self._mmc.enableContinuousFocus(False)
                         self._perform_autofocus()
-                        self._mmc.enableContinuousFocus(af_engaged)
-                        self._wait_for_autofocus_devices()
                     except RuntimeError as e:
                         logger.warning("Hardware autofocus failed. %s", e)
+                    finally:
+                        # restore continuous focus even when autofocus failed,
+                        # so a focus timeout (e.g. PFS out of range after a
+                        # long move) does not leave continuous focus disabled
+                        try:
+                            self._mmc.enableContinuousFocus(af_engaged)
+                            self._wait_for_autofocus_devices()
+                        except RuntimeError as e:
+                            logger.warning(
+                                "Could not restore continuous focus. %s", e
+                            )
 
     def _perform_autofocus(self) -> None:
         # run autofocus (run 3 times in case it fails)
