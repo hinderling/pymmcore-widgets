@@ -431,7 +431,6 @@ class CoreConnectedPositionTable(PositionTable):
     def _move_to_position(self, data: dict, include_z: bool) -> None:
         # check if autofocus is locked before moving
         af_engaged = self._mmc.isContinuousFocusLocked()
-        af_offset = self._mmc.getAutoFocusOffset() if af_engaged else None
 
         if xy_dev := self._mmc.getXYStageDevice():
             x = data.get(self.X.key, self._mmc.getXPosition())
@@ -446,33 +445,29 @@ class CoreConnectedPositionTable(PositionTable):
 
         # HANDLE AUTOFOCUS OFFSET___________________________________________________
 
-        # if 'af_per_position' is not checked, 'AF.key' will not be in 'data and
-        # 'table_af' will be None. here we get the autofocus offset from the table
+        # Only an explicit per-position offset ('af_per_position' checked)
+        # runs the offset/fullFocus routine. With continuous focus engaged
+        # and no per-position offset, the move is left as the hardware ends
+        # it: a commanded Z move disengages continuous focus by design, and
+        # the fullFocus round-trip holds the hub's serial lock for seconds,
+        # stalling every widget that polls the core.
         table_af_offset = data.get(self.AF.key, None)
-
-        # if 'af_per_position' is checked, 'table_af' is not 'None' and we use it.
-        # if 'af_per_position' is not checked but the autofocus was locked before
-        # moving, we use the 'af_offset' (from before moving). Otherwise,
-        # if 'af_per_position' is not checked and the autofocus was not locked
-        # before moving, we do not use autofocus.
-        if table_af_offset is not None or af_offset is not None:
-            _af = table_af_offset if table_af_offset is not None else af_offset
-            if _af is not None:
-                self._mmc.setAutoFocusOffset(_af)
+        if table_af_offset is not None:
+            self._mmc.setAutoFocusOffset(table_af_offset)
+            try:
+                self._mmc.enableContinuousFocus(False)
+                self._perform_autofocus()
+            except RuntimeError as e:
+                logger.warning("Hardware autofocus failed. %s", e)
+            finally:
+                # restore continuous focus even when autofocus failed,
+                # so a focus timeout (e.g. PFS out of range after a
+                # long move) does not leave continuous focus disabled
                 try:
-                    self._mmc.enableContinuousFocus(False)
-                    self._perform_autofocus()
+                    self._mmc.enableContinuousFocus(af_engaged)
+                    self._wait_for_autofocus_devices()
                 except RuntimeError as e:
-                    logger.warning("Hardware autofocus failed. %s", e)
-                finally:
-                    # restore continuous focus even when autofocus failed,
-                    # so a focus timeout (e.g. PFS out of range after a
-                    # long move) does not leave continuous focus disabled
-                    try:
-                        self._mmc.enableContinuousFocus(af_engaged)
-                        self._wait_for_autofocus_devices()
-                    except RuntimeError as e:
-                        logger.warning("Could not restore continuous focus. %s", e)
+                    logger.warning("Could not restore continuous focus. %s", e)
 
     def _perform_autofocus(self) -> None:
         # run autofocus (run 3 times in case it fails)
